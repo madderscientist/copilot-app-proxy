@@ -1,0 +1,15 @@
+node_modules/
+.venv/
+.local/
+.env
+.env.*
+__pycache__/
+*.pyc
+*.dpapi
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+*.log
