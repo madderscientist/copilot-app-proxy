@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "copilot-app-proxy"
 version = "0.2.0"
-description = "Local Messages API gateway and transparent token relay for Microsoft Copilot App."
+description = "Local Messages API gateway relaying Microsoft Copilot App tokens."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,7 +21,7 @@ dev = [
 ]
 
 [project.scripts]
-copilot-proxy = "copilot_app_proxy.__main__:main"
+copilot-proxy = "copilot_app_proxy.cli.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["copilot_app_proxy*"]

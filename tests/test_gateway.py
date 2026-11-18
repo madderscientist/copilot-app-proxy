@@ -14,38 +14,51 @@ import aiohttp
 import pytest
 from aiohttp import web
 
-from copilot_app_proxy.gateway import CLIENT_SESSION_KEY, create_app
-from copilot_app_proxy.relay_store import RelayTokenStore
+from copilot_app_proxy.cli.diagnostics import fetch_healthz
+from copilot_app_proxy.dpapi import DpapiError
+from copilot_app_proxy.gateway import CLIENT_SESSION_KEY, create_app, listen
+from copilot_app_proxy.relay_store import RelayTokenStore, TokenPersistError
 
 SYNTHETIC_TOKEN = "synthetic-test-token-not-a-real-credential"
-AUTH = {"authorization": f"Bearer {SYNTHETIC_TOKEN}"}
-LOCAL_KEY = "synthetic-local-gateway-key-at-least-thirty-two-characters"
+CALLER_CREDENTIAL = "caller-credential-must-not-forward"
 RELAY_SECRET = "synthetic-relay-ingest-secret-at-least-thirty-two-chars"
 
 
-async def _start_app(app: web.Application) -> tuple[web.AppRunner, str]:
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    port = runner.addresses[0][1]
-    return runner, f"http://127.0.0.1:{port}"
-
-
 @asynccontextmanager
-async def gateway_fixture(upstream_handler, **gateway_kwargs):
+async def gateway_fixture(upstream_handler, *, relay_store=None, **gateway_kwargs):
+    if relay_store is None:
+        relay_store = RelayTokenStore()
+        await relay_store.set_token(SYNTHETIC_TOKEN)
     upstream_app = web.Application()
     upstream_app.router.add_route("*", "/{tail:.*}", upstream_handler)
-    up_runner, up_url = await _start_app(upstream_app)
-    gw_app = create_app(upstream_base=f"{up_url}/api/v1/llmapi/", **gateway_kwargs)
-    gw_runner, gw_url = await _start_app(gw_app)
-    try:
-        async with aiohttp.ClientSession() as client:
-            yield gw_url, client
-    finally:
-        await gw_runner.cleanup()
-        await up_runner.cleanup()
+    async with listen(upstream_app, 0) as upstream:
+        up_url = f"http://127.0.0.1:{upstream.addresses[0][1]}"
+        gw_app = create_app(
+            upstream_base=f"{up_url}/api/v1/llmapi/",
+            relay_store=relay_store,
+            relay_ingest_secret=RELAY_SECRET,
+            **gateway_kwargs,
+        )
+        async with listen(gw_app, 0) as gateway, aiohttp.ClientSession() as client:
+            yield f"http://127.0.0.1:{gateway.addresses[0][1]}", client
     assert gw_app[CLIENT_SESSION_KEY].closed
+
+
+@pytest.mark.asyncio
+async def test_core_listener_and_health_probe():
+    def app() -> web.Application:
+        return create_app(relay_store=RelayTokenStore(), relay_ingest_secret=RELAY_SECRET)
+
+    with pytest.raises(ValueError, match="relay_ingest_secret"):
+        create_app(relay_store=RelayTokenStore(), relay_ingest_secret="too-short")
+    async with listen(app(), 0) as gateway:
+        port = gateway.addresses[0][1]
+        health = await asyncio.to_thread(fetch_healthz, port)
+        assert health and health["status"] == "ok"
+        with pytest.raises(OSError):
+            async with listen(second := app(), port):
+                pytest.fail("The same loopback port cannot be bound twice.")
+        assert second[CLIENT_SESSION_KEY].closed
 
 
 def _make_jwt(exp: int) -> str:
@@ -54,7 +67,7 @@ def _make_jwt(exp: int) -> str:
 
 
 @pytest.mark.asyncio
-async def test_messages_json_and_tools_forwarded_unchanged_with_scoped_headers():
+async def test_messages_forwarded_with_relayed_token_instead_of_caller_credentials():
     captured: dict = {}
 
     async def handler(request: web.Request) -> web.Response:
@@ -77,7 +90,12 @@ async def test_messages_json_and_tools_forwarded_unchanged_with_scoped_headers()
         }
     )
 
-    headers = {**AUTH, "cookie": "must-not-forward=1", "x-unrelated-secret": "must-not-forward"}
+    headers = {
+        "authorization": f"Bearer {CALLER_CREDENTIAL}",
+        "x-api-key": CALLER_CREDENTIAL,
+        "cookie": "must-not-forward=1",
+        "x-unrelated-secret": "must-not-forward",
+    }
     async with (
         gateway_fixture(handler) as (url, client),
         client.post(f"{url}/v1/messages", data=body, headers=headers) as resp,
@@ -89,7 +107,8 @@ async def test_messages_json_and_tools_forwarded_unchanged_with_scoped_headers()
 
     assert captured["path"] == "/api/v1/llmapi/v1/messages"
     assert captured["body"] == body
-    assert captured["headers"]["authorization"] == AUTH["authorization"]
+    assert captured["headers"]["authorization"] == f"Bearer {SYNTHETIC_TOKEN}"
+    assert "x-api-key" not in captured["headers"]
     assert captured["headers"]["x-clienttype"] == "Copilot"
     assert captured["headers"]["x-clientscenario"] == "Code"
     assert captured["headers"]["anthropic-version"] == "2023-06-01"
@@ -100,7 +119,7 @@ async def test_messages_json_and_tools_forwarded_unchanged_with_scoped_headers()
 
 
 @pytest.mark.asyncio
-async def test_x_api_key_accepted_and_models_path_mapped():
+async def test_models_path_mapped_without_caller_credentials():
     captured: dict = {}
 
     async def handler(request: web.Request) -> web.Response:
@@ -110,13 +129,16 @@ async def test_x_api_key_accepted_and_models_path_mapped():
 
     async with (
         gateway_fixture(handler) as (url, client),
-        client.get(f"{url}/v1/models", headers={"x-api-key": SYNTHETIC_TOKEN}) as resp,
+        client.get(f"{url}/v1/models") as resp,
     ):
         assert resp.status == 200
         data = await resp.json()
         assert data["data"][0]["id"] == "claude-opus-5.5"
 
-    assert captured == {"path": "/api/v1/llmapi/models", "authorization": AUTH["authorization"]}
+    assert captured == {
+        "path": "/api/v1/llmapi/models",
+        "authorization": f"Bearer {SYNTHETIC_TOKEN}",
+    }
 
 
 @pytest.mark.asyncio
@@ -138,7 +160,7 @@ async def test_sse_first_chunk_arrives_before_upstream_finishes():
 
     async with (
         gateway_fixture(handler) as (url, client),
-        client.post(f"{url}/v1/messages", headers=AUTH, data="{}") as resp,
+        client.post(f"{url}/v1/messages", data="{}") as resp,
     ):
         assert resp.headers.get("content-type") == "text/event-stream"
         first_chunk = await asyncio.wait_for(resp.content.readany(), timeout=2.0)
@@ -162,7 +184,7 @@ async def test_upstream_auth_failures_preserved():
 
     async with (
         gateway_fixture(handler) as (url, client),
-        client.post(f"{url}/v1/messages", headers=AUTH, data="{}") as resp,
+        client.post(f"{url}/v1/messages", data="{}") as resp,
     ):
         assert resp.status == 401
         assert resp.headers.get("www-authenticate") == "Bearer"
@@ -180,23 +202,22 @@ async def test_invalid_requests_never_reach_upstream():
         return web.Response(text="ok")
 
     cases = [
-        ("POST", "/v1/messages", {}, "{}", 401),
-        ("POST", "/v1/messages", AUTH, "not-json", 400),
-        ("POST", "/v1/messages", AUTH, "[]", 400),
-        ("POST", "/v1/messages", AUTH, b"\xff", 400),
-        ("POST", "/v1/messages", AUTH, json.dumps({"text": "x" * 300}), 413),
-        ("POST", "/v1/messages", {**AUTH, "x-api-key": SYNTHETIC_TOKEN}, "{}", 401),
+        ("POST", "/v1/messages", {}, "not-json", 400),
+        ("POST", "/v1/messages", {}, "[]", 400),
+        ("POST", "/v1/messages", {}, b"\xff", 400),
+        ("POST", "/v1/messages", {}, json.dumps({"text": "x" * 300}), 413),
         ("GET", "/healthz", {"origin": "https://untrusted.invalid"}, None, 403),
         ("GET", "/healthz", {"host": "untrusted.invalid"}, None, 403),
-        ("POST", "/v1/messages?access_token=must-not-leak", AUTH, "{}", 400),
-        ("GET", "/proxy/https://untrusted.invalid", AUTH, None, 404),
-        ("GET", "/v1/messages", AUTH, None, 405),
+        ("POST", "/v1/messages", {"origin": "https://untrusted.invalid"}, "{}", 403),
+        ("POST", "/v1/messages?access_token=must-not-leak", {}, "{}", 400),
+        ("GET", "/proxy/https://untrusted.invalid", {}, None, 404),
+        ("GET", "/v1/messages", {}, None, 405),
     ]
 
     async with gateway_fixture(handler, body_limit=256) as (url, client):
         async with client.get(f"{url}/healthz") as resp:
             assert resp.status == 200
-            assert (await resp.json())["upstreamAuthenticated"] is False
+            assert (await resp.json())["upstreamAuthenticated"] is True
         for method, path, headers, body, expected_status in cases:
             async with client.request(method, f"{url}{path}", headers=headers, data=body) as resp:
                 assert resp.status == expected_status
@@ -222,7 +243,7 @@ async def test_upstream_errors_do_not_leak_credentials(status):
     timeout_ms = 100 if status == 504 else 2_000
     async with (
         gateway_fixture(handler, timeout_ms=timeout_ms) as (url, client),
-        client.post(f"{url}/v1/messages", headers=AUTH, data="{}") as resp,
+        client.post(f"{url}/v1/messages", data="{}") as resp,
     ):
         assert resp.status == status
         assert resp.headers["cache-control"] == "no-store"
@@ -234,71 +255,7 @@ async def test_upstream_errors_do_not_leak_credentials(status):
 
 
 @pytest.mark.asyncio
-async def test_token_provider_validates_local_key_and_injects_upstream_token():
-    provider_calls = 0
-    upstream_auth: str | None = None
-
-    async def handler(request: web.Request) -> web.Response:
-        nonlocal upstream_auth
-        upstream_auth = request.headers.get("authorization")
-        await request.read()
-        return web.json_response({"type": "message", "content": []})
-
-    async def token_provider() -> str:
-        nonlocal provider_calls
-        provider_calls += 1
-        return SYNTHETIC_TOKEN
-
-    async with gateway_fixture(handler, local_api_key=LOCAL_KEY, token_provider=token_provider) as (
-        url,
-        client,
-    ):
-        async with client.post(f"{url}/v1/messages", headers=AUTH, data="{}") as denied:
-            assert denied.status == 401
-        assert provider_calls == 0
-
-        async with client.post(
-            f"{url}/v1/messages", headers={"x-api-key": LOCAL_KEY}, data="{}"
-        ) as accepted:
-            assert accepted.status == 200
-        assert provider_calls == 1
-        assert upstream_auth == f"Bearer {SYNTHETIC_TOKEN}"
-        assert LOCAL_KEY not in (upstream_auth or "")
-
-        async with client.get(f"{url}/healthz") as health:
-            assert (await health.json())["authentication"] == "local-gateway-key"
-
-
-@pytest.mark.asyncio
-async def test_token_provider_fails_closed_on_errors():
-    upstream_calls = 0
-
-    async def handler(_: web.Request) -> web.Response:
-        nonlocal upstream_calls
-        upstream_calls += 1
-        return web.Response(text="ok")
-
-    async def failing_provider() -> str:
-        raise RuntimeError(f"private upstream failure: {SYNTHETIC_TOKEN}")
-
-    async with gateway_fixture(
-        handler, local_api_key=LOCAL_KEY, token_provider=failing_provider
-    ) as (url, client):
-        async with client.post(
-            f"{url}/v1/messages", headers={"x-api-key": LOCAL_KEY}, data="{}"
-        ) as resp:
-            assert resp.status == 401
-            text = await resp.text()
-            assert SYNTHETIC_TOKEN not in text
-            assert LOCAL_KEY not in text
-        assert upstream_calls == 0
-
-    with pytest.raises(ValueError, match="local API key"):
-        create_app(token_provider=lambda: SYNTHETIC_TOKEN)
-
-
-@pytest.mark.asyncio
-async def test_relay_mode_ingests_token_stores_dpapi_cache_and_forwards(tmp_path):
+async def test_relay_ingests_token_stores_dpapi_cache_and_forwards(tmp_path):
     token_file = tmp_path / "token.dpapi"
     relay_store = RelayTokenStore(token_file=token_file)
     upstream_auth: str | None = None
@@ -309,25 +266,16 @@ async def test_relay_mode_ingests_token_stores_dpapi_cache_and_forwards(tmp_path
         await request.read()
         return web.json_response({"type": "message", "content": [{"type": "text", "text": "OK"}]})
 
-    async with gateway_fixture(
-        handler,
-        local_api_key=LOCAL_KEY,
-        relay_store=relay_store,
-        relay_ingest_secret=RELAY_SECRET,
-        auth_mode="copilot-token-relay",
-        token_provider=relay_store.get_token,
-    ) as (url, client):
-        async with client.post(
-            f"{url}/v1/messages", headers={"x-api-key": LOCAL_KEY}, data="{}"
-        ) as before:
+    async with gateway_fixture(handler, relay_store=relay_store) as (url, client):
+        async with client.post(f"{url}/v1/messages", data="{}") as before:
             assert before.status == 401
 
-        async with client.post(
-            f"{url}/_internal/token",
-            headers={"x-relay-secret": "wrong-secret"},
-            json={"token": SYNTHETIC_TOKEN},
-        ) as bad_secret:
-            assert bad_secret.status == 401
+        for secret_headers in ({}, {"x-relay-secret": "wrong-secret"}):
+            async with client.post(
+                f"{url}/_internal/token", headers=secret_headers, json={"token": SYNTHETIC_TOKEN}
+            ) as bad_secret:
+                assert bad_secret.status == 401
+        assert relay_store.status()["hasToken"] is False
 
         jwt_token = _make_jwt(int(time.time()) + 3600)
         async with client.post(
@@ -351,7 +299,7 @@ async def test_relay_mode_ingests_token_stores_dpapi_cache_and_forwards(tmp_path
             await reloaded.set_token(jwt_token)
             save.assert_not_called()
             save.side_effect = OSError("synthetic write failure")
-            with pytest.raises(OSError, match="synthetic write failure"):
+            with pytest.raises(TokenPersistError, match="Could not persist the relay token"):
                 await reloaded.set_token(SYNTHETIC_TOKEN)
             assert reloaded.get_token() == jwt_token
             save.side_effect = None
@@ -359,17 +307,44 @@ async def test_relay_mode_ingests_token_stores_dpapi_cache_and_forwards(tmp_path
             assert reloaded.get_token() == SYNTHETIC_TOKEN
 
         async with client.get(f"{url}/healthz") as health:
-            health_json = await health.json()
-            assert health_json["authentication"] == "copilot-token-relay"
-            assert health_json["upstreamAuthenticated"] is True
+            assert (await health.json())["upstreamAuthenticated"] is True
 
         async with client.post(
             f"{url}/v1/messages",
-            headers={"x-api-key": LOCAL_KEY},
             json={"model": "claude-opus-5.5", "messages": [{"role": "user", "content": "hi"}]},
         ) as ok_resp:
             assert ok_resp.status == 200
             assert upstream_auth == f"Bearer {jwt_token}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [OSError, DpapiError])
+async def test_relay_ingest_reports_storage_failure_as_server_error(tmp_path, failure_type):
+    store = RelayTokenStore(tmp_path / "token.dpapi")
+    headers = {"x-relay-secret": RELAY_SECRET}
+
+    async def upstream(_: web.Request) -> web.Response:
+        pytest.fail("Token ingestion must not contact the upstream.")
+
+    async with gateway_fixture(upstream, relay_store=store) as (url, client):
+        endpoint = f"{url}/_internal/token"
+        with patch(
+            "copilot_app_proxy.relay_store.save_protected_text",
+            side_effect=[failure_type("private storage details"), None],
+        ) as save:
+            async with client.post(endpoint, headers=headers, json={"token": None}) as resp:
+                assert resp.status == 400
+            save.assert_not_called()
+            async with client.post(endpoint, headers=headers, json={"token": SYNTHETIC_TOKEN}) as resp:
+                assert resp.status == 500
+                assert await resp.json() == {
+                    "type": "error",
+                    "error": {"type": "api_error", "message": "Could not persist the relay token."},
+                }
+            assert not store.status()["hasToken"]
+            async with client.post(endpoint, headers=headers, json={"token": SYNTHETIC_TOKEN}) as resp:
+                assert resp.status == 200
+            assert store.get_token() == SYNTHETIC_TOKEN
 
 
 @pytest.mark.asyncio
@@ -382,15 +357,11 @@ async def test_relay_missing_and_expired_token_errors_preserve_copilot_instructi
         upstream_calls += 1
         return web.Response(text="ok")
 
-    async with gateway_fixture(
-        handler, local_api_key=LOCAL_KEY, token_provider=relay_store.get_token
-    ) as (url, client):
+    async with gateway_fixture(handler, relay_store=relay_store) as (url, client):
         for expired in (False, True):
             if expired:
                 await relay_store.set_token(_make_jwt(1))
-            async with client.post(
-                f"{url}/v1/messages", headers={"x-api-key": LOCAL_KEY}, data="{}"
-            ) as resp:
+            async with client.post(f"{url}/v1/messages", data="{}") as resp:
                 assert resp.status == 401
                 result = await resp.json()
                 msg = result["error"]["message"]

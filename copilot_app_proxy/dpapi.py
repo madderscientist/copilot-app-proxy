@@ -11,7 +11,15 @@ import tempfile
 from ctypes import wintypes
 from pathlib import Path
 
-CRYPTPROTECT_UI_FORBIDDEN = 0x01
+__all__ = [
+    "DpapiError",
+    "load_protected_text",
+    "protect_text",
+    "save_protected_text",
+    "unprotect_text",
+]
+
+_CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
 
 class DpapiError(RuntimeError):
@@ -72,7 +80,7 @@ def _crypt_bytes(data: bytes, *, decrypt: bool) -> bytes:
         None,
         None,
         None,
-        CRYPTPROTECT_UI_FORBIDDEN,
+        _CRYPTPROTECT_UI_FORBIDDEN,
         ctypes.byref(blob_out),
     ):
         raise DpapiError(f"DPAPI {operation} failed.")
@@ -83,21 +91,11 @@ def _crypt_bytes(data: bytes, *, decrypt: bool) -> bytes:
         _kernel32.LocalFree(blob_out.pbData)
 
 
-def protect_bytes(plain: bytes) -> bytes:
-    """Encrypt bytes using CurrentUser DPAPI."""
-    return _crypt_bytes(plain, decrypt=False)
-
-
-def unprotect_bytes(cipher: bytes) -> bytes:
-    """Decrypt CurrentUser DPAPI-protected bytes."""
-    return _crypt_bytes(cipher, decrypt=True)
-
-
 def protect_text(plain_text: str) -> str:
     """Encrypt UTF-8 text and return a base64-encoded DPAPI payload."""
     if not plain_text.strip():
         raise DpapiError("DPAPI protect failed: input is empty.")
-    encrypted = protect_bytes(plain_text.encode("utf-8"))
+    encrypted = _crypt_bytes(plain_text.encode("utf-8"), decrypt=False)
     return base64.b64encode(encrypted).decode("ascii")
 
 
@@ -110,7 +108,7 @@ def unprotect_text(encoded_text: str) -> str:
         cipher = base64.b64decode(stripped, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise DpapiError("DPAPI unprotect failed: invalid base64 payload.") from exc
-    return unprotect_bytes(cipher).decode("utf-8")
+    return _crypt_bytes(cipher, decrypt=True).decode("utf-8")
 
 
 def save_protected_text(file_path: str | Path, plain_text: str) -> None:

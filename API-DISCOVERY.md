@@ -154,7 +154,7 @@ VS Code → 本机网关 → 附加当前令牌 → 原模型 API
 
 Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目标模型 API 请求中的访问令牌，不收集 Cookie 或刷新令牌，也不以应用身份自行执行刷新。
 
-本机网关密钥和内部令牌接收密钥相互独立。VS Code 只使用本机网关密钥，不接收云端访问令牌。访问令牌保存在内存和当前 Windows 用户范围的 DPAPI 加密缓存中，不以明文落盘或写入日志。
+本机网关只接受来自 loopback 且不带浏览器 Origin 的请求，调用方无需密钥；令牌接收接口使用每次启动随机生成的内部密钥，只有本次运行的插件持有。VS Code 不接收云端访问令牌。访问令牌保存在内存和当前 Windows 用户范围的 DPAPI 加密缓存中，不以明文落盘或写入日志。
 
 令牌过期时，需要 Copilot App 取得新令牌，并通过后续请求让中继更新缓存。中继并不保证应用关闭后还能无限续期。
 
@@ -208,9 +208,9 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 
 当前架构和日常启动、停止、VS Code 配置见 [README.md](README.md)。主要实现位于：
 
-- [relay_addon.py](relay_addon.py)：定向提取访问令牌并推送到本机内部接口，成功后才标记去重。
-- [server.mjs](server.mjs)：模型请求入口、令牌缓存、必要协议头和 JSON/SSE 转发。
-- [dpapi.mjs](dpapi.mjs)：Windows 当前用户范围的加密读写。
-- [start-transparent-proxy.ps1](start-transparent-proxy.ps1) 与 [stop-transparent-proxy.ps1](stop-transparent-proxy.ps1)：进程级代理、临时证书和应用启动方式的管理。
+- [relay_addon.py](copilot_app_proxy/relay_addon.py)：定向提取访问令牌并推送到本机内部接口，成功后才标记去重。
+- [gateway.py](copilot_app_proxy/gateway.py) 与 [relay_store.py](copilot_app_proxy/relay_store.py)：模型请求入口、令牌缓存、必要协议头和 JSON/SSE 转发。
+- [dpapi.py](copilot_app_proxy/dpapi.py)：Windows 当前用户范围的加密读写。
+- [launcher.py](copilot_app_proxy/cli/launcher.py) 与 [windows.py](copilot_app_proxy/cli/windows.py)：进程级代理、临时证书和应用启动方式的管理。
 
 后续排查应先区分三层：本机代理是否运行、目标令牌是否仍可用、服务协议是否变化。不要仅凭健康检查或某个静态字符串就认定模型调用已经成功，也不要把临时 API 错误直接归因于账号无权限。

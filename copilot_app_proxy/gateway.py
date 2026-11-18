@@ -1,28 +1,40 @@
-"""Local Messages API gateway using aiohttp."""
+"""Local Messages API gateway that forwards loopback requests with the relayed Copilot token."""
 
 from __future__ import annotations
 
 import asyncio
 import hmac
-import inspect
 import json
-import os
-import re
-import sys
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
 from aiohttp import web
 
-from copilot_app_proxy.relay_store import TOKEN_PATTERN, RelayTokenStore, RequestError
+from copilot_app_proxy.relay_store import (
+    InvalidTokenError,
+    RelayTokenStore,
+    TokenError,
+    TokenPersistError,
+)
 
 DEFAULT_UPSTREAM = "https://loki.delve.office.com/api/v1/llmapi/"
+DEFAULT_BODY_LIMIT = 8 * 1024 * 1024
+DEFAULT_TIMEOUT_MS = 120_000
+INGEST_BODY_LIMIT = 64 * 1024
+MIN_INGEST_SECRET_LENGTH = 32
+
 CLIENT_SESSION_KEY = web.AppKey("http_client", aiohttp.ClientSession)
+
+# Local path -> (method, upstream path relative to the upstream base URL).
+MODEL_ROUTES = {
+    "/v1/messages": ("POST", "v1/messages"),
+    "/v1/messages/count_tokens": ("POST", "v1/messages/count_tokens"),
+    "/v1/models": ("GET", "models"),
+}
 
 RESPONSE_HEADERS = (
     "content-type",
@@ -39,22 +51,17 @@ RESPONSE_HEADERS = (
     "anthropic-ratelimit-tokens-reset",
 )
 
-_BEARER_RE = re.compile(r"^Bearer\s+(\S+)$", re.IGNORECASE)
+Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
-@dataclass(frozen=True)
-class RouteSpec:
-    method: str
-    upstream_path: str
+class RequestError(Exception):
+    """HTTP error rendered as an Anthropic-compatible JSON error payload."""
 
-
-ROUTES: dict[str, RouteSpec] = {
-    "/v1/messages": RouteSpec(method="POST", upstream_path="v1/messages"),
-    "/v1/messages/count_tokens": RouteSpec(method="POST", upstream_path="v1/messages/count_tokens"),
-    "/v1/models": RouteSpec(method="GET", upstream_path="models"),
-}
-
-TokenProvider = Callable[[], str | Awaitable[str]]
+    def __init__(self, status: int, error_type: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error_type = error_type
+        self.message = message
 
 
 def _json_response(
@@ -69,45 +76,29 @@ def _json_response(
     return web.json_response(payload, status=status, headers=response_headers)
 
 
-def _require_secret(candidate: str | None, expected: str, message: str) -> None:
-    if isinstance(candidate, str) and hmac.compare_digest(
-        candidate.encode("utf-8"), expected.encode("utf-8")
-    ):
-        return
-    raise RequestError(401, "authentication_error", message)
+def _error_response(
+    status: int, error_type: str, message: str, *, headers: Mapping[str, str] | None = None
+) -> web.Response:
+    payload = {"type": "error", "error": {"type": error_type, "message": message}}
+    return _json_response(status, payload, headers=headers)
 
 
-def _caller_token(request: web.Request) -> str:
-    cred_headers = [
-        name
-        for name, _ in request.raw_headers
-        if name.decode("latin-1").lower() in ("authorization", "x-api-key")
-    ]
-    if len(cred_headers) != 1:
-        raise RequestError(
-            401,
-            "authentication_error",
-            "Provide exactly one Authorization: Bearer or x-api-key "
-            "containing a valid upstream access token.",
-        )
-    authorization = request.headers.get("authorization")
-    if authorization is not None:
-        match = _BEARER_RE.match(authorization)
-        token = match.group(1) if match else None
-    else:
-        token = request.headers.get("x-api-key")
-    if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
-        raise RequestError(401, "authentication_error", "Invalid access token format.")
-    return token
+def _token_request_error(exc: TokenError) -> RequestError:
+    if isinstance(exc, InvalidTokenError):
+        return RequestError(400, "invalid_request_error", str(exc))
+    if isinstance(exc, TokenPersistError):
+        return RequestError(500, "api_error", str(exc))
+    return RequestError(401, "authentication_error", str(exc))
 
 
 def _validate_local_request(request: web.Request) -> None:
+    """Reject anything a browser page could send: foreign Host, Origin, or absolute paths."""
     hosts = request.headers.getall("host", [])
     if len(hosts) != 1:
         raise RequestError(403, "permission_error", "A loopback Host header is required.")
-    host = hosts[0]
     try:
-        authority = urlsplit(f"http://{host}")
+        authority = urlsplit(f"http://{hosts[0]}")
+        host_port = authority.port or 80
     except ValueError as exc:
         raise RequestError(
             403, "permission_error", "Only this loopback endpoint is allowed."
@@ -115,13 +106,6 @@ def _validate_local_request(request: web.Request) -> None:
 
     sockname = request.transport.get_extra_info("sockname") if request.transport else None
     local_port = sockname[1] if isinstance(sockname, tuple) and len(sockname) >= 2 else None
-    try:
-        host_port = authority.port or 80
-    except ValueError as exc:
-        raise RequestError(
-            403, "permission_error", "Only this loopback endpoint is allowed."
-        ) from exc
-
     if (
         authority.hostname not in ("localhost", "127.0.0.1")
         or authority.username is not None
@@ -143,32 +127,44 @@ def _validate_local_request(request: web.Request) -> None:
         raise RequestError(400, "invalid_request_error", "Query parameters are not accepted.")
 
 
+@web.middleware
+async def _local_api_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+    """Validate every request before routing and render all failures as JSON errors."""
+    try:
+        _validate_local_request(request)
+        return await handler(request)
+    except RequestError as exc:
+        return _error_response(exc.status, exc.error_type, exc.message)
+    except TokenError as exc:
+        error = _token_request_error(exc)
+        return _error_response(error.status, error.error_type, error.message)
+    except web.HTTPMethodNotAllowed as exc:
+        allow = ", ".join(sorted(exc.allowed_methods))
+        return _error_response(
+            405, "invalid_request_error", "Method not allowed.", headers={"allow": allow}
+        )
+    except web.HTTPNotFound:
+        return _error_response(404, "not_found_error", "Unknown API route.")
+    except Exception:  # noqa: BLE001
+        return _error_response(400, "invalid_request_error", "Invalid request.")
+
+
 async def _read_json_body(
     request: web.Request, limit: int, timeout_sec: float
 ) -> tuple[bytes, dict[str, Any]]:
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            if int(declared) > limit:
-                raise RequestError(
-                    413, "invalid_request_error", "Request body exceeds the configured limit."
-                )
-        except ValueError:
-            pass
-
-    chunks: list[bytes] = []
-    total = 0
+    if (length := request.content_length) is not None and length > limit:
+        raise RequestError(413, "invalid_request_error", "Request body exceeds the configured limit.")
+    buffer = bytearray()
     try:
         async with asyncio.timeout(timeout_sec):
             async for chunk in request.content.iter_any():
-                total += len(chunk)
-                if total > limit:
+                if len(buffer) + len(chunk) > limit:
                     raise RequestError(
                         413,
                         "invalid_request_error",
                         "Request body exceeds the configured limit.",
                     )
-                chunks.append(chunk)
+                buffer.extend(chunk)
     except TimeoutError as exc:
         raise RequestError(408, "timeout_error", "Request body timed out.") from exc
     except RequestError:
@@ -176,7 +172,7 @@ async def _read_json_body(
     except Exception as exc:
         raise RequestError(400, "invalid_request_error", "Request body could not be read.") from exc
 
-    body = b"".join(chunks)
+    body = bytes(buffer)
     try:
         parsed = json.loads(body.decode("utf-8"))
         if not isinstance(parsed, dict):
@@ -196,6 +192,7 @@ async def _forward(
     body: bytes | None,
     timeout_sec: float,
 ) -> web.StreamResponse:
+    # Built from scratch so caller credentials and other headers never reach the upstream.
     headers: dict[str, str] = {
         "authorization": f"Bearer {token}",
         "accept": "application/json, text/event-stream",
@@ -249,214 +246,101 @@ async def _forward(
         raise RequestError(502, "api_error", "Upstream connection failed.") from exc
 
 
-def create_app(
-    *,
-    upstream_base: str = DEFAULT_UPSTREAM,
-    body_limit: int = 8 * 1024 * 1024,
-    timeout_ms: int = 120_000,
-    token_provider: TokenProvider | None = None,
-    local_api_key: str | None = None,
-    relay_store: RelayTokenStore | None = None,
-    relay_ingest_secret: str | None = None,
-    auth_mode: str | None = None,
-) -> web.Application:
-    """Create the aiohttp gateway application."""
-    if token_provider is not None and (
-        not callable(token_provider)
-        or not isinstance(local_api_key, str)
-        or len(local_api_key) < 32
-    ):
-        raise ValueError(
-            "Managed login requires a token provider and a local API key of at least 32 characters."
-        )
-    if relay_store is not None and (
-        not isinstance(relay_ingest_secret, str) or len(relay_ingest_secret) < 32
-    ):
-        raise ValueError("Relay mode requires a relay_ingest_secret of at least 32 characters.")
+async def _http_client(app: web.Application) -> AsyncGenerator[None, None]:
+    async with aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=64), auto_decompress=False
+    ) as session:
+        app[CLIENT_SESSION_KEY] = session
+        yield
 
-    parsed_base = urlsplit(upstream_base)
+
+def _validate_upstream_base(upstream_base: str) -> None:
+    parsed = urlsplit(upstream_base)
     if (
-        parsed_base.scheme not in ("http", "https")
-        or parsed_base.username is not None
-        or parsed_base.password is not None
-        or not parsed_base.path.endswith("/")
-        or parsed_base.query
-        or parsed_base.fragment
+        parsed.scheme not in ("http", "https")
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.endswith("/")
+        or parsed.query
+        or parsed.fragment
     ):
         raise ValueError("Invalid upstream base URL.")
 
+
+def create_app(
+    *,
+    relay_store: RelayTokenStore,
+    relay_ingest_secret: str,
+    upstream_base: str = DEFAULT_UPSTREAM,
+    body_limit: int = DEFAULT_BODY_LIMIT,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+) -> web.Application:
+    """Create the gateway app.
+
+    Model routes need no caller credentials: any local program may call them, while the
+    Host/Origin checks keep browser pages out. Only the relay addon may push tokens, using
+    the per-run ``relay_ingest_secret``.
+    """
+    if not isinstance(relay_ingest_secret, str) or len(relay_ingest_secret) < (
+        MIN_INGEST_SECRET_LENGTH
+    ):
+        raise ValueError(
+            f"relay_ingest_secret must be at least {MIN_INGEST_SECRET_LENGTH} characters."
+        )
+    _validate_upstream_base(upstream_base)
     timeout_sec = timeout_ms / 1000.0
-    effective_auth_mode = auth_mode or (
-        "local-gateway-key" if token_provider else "caller-provided-upstream-token"
-    )
+    expected_secret = relay_ingest_secret.encode("utf-8")
 
-    async def http_client(app: web.Application) -> AsyncIterator[None]:
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=64), auto_decompress=False
-        ) as session:
-            app[CLIENT_SESSION_KEY] = session
-            yield
+    async def healthz(request: web.Request) -> web.Response:
+        status = relay_store.status()
+        return _json_response(
+            200,
+            {
+                "status": "ok",
+                "upstreamAuthenticated": status["hasToken"],
+                "tokenExpiresOn": status["tokenExpiresOn"],
+                "expiresInSeconds": status["expiresInSeconds"],
+            },
+        )
 
-    async def handle_all(request: web.Request) -> web.StreamResponse:
-        extra_headers: dict[str, str] = {}
-        try:
-            _validate_local_request(request)
-            path = request.path
+    async def ingest_token(request: web.Request) -> web.Response:
+        secret = request.headers.get("x-relay-secret")
+        if secret is None:
+            raise RequestError(401, "authentication_error", "Missing relay ingest secret.")
+        if not hmac.compare_digest(secret.encode("utf-8"), expected_secret):
+            raise RequestError(401, "authentication_error", "Invalid relay ingest secret.")
+        _, payload = await _read_json_body(request, INGEST_BODY_LIMIT, timeout_sec)
+        info = await relay_store.set_token(payload.get("token"))
+        return _json_response(200, {"status": "updated", "tokenExpiresOn": info["expiresOn"]})
 
-            if path == "/healthz" and request.method == "GET":
-                relay_status = relay_store.status() if relay_store is not None else None
-                payload: dict[str, Any] = {
-                    "status": "ok",
-                    "authentication": effective_auth_mode,
-                    "upstreamAuthenticated": relay_status["hasToken"] if relay_status else False,
-                }
-                if relay_status is not None:
-                    payload["tokenExpiresOn"] = relay_status["tokenExpiresOn"]
-                    payload["expiresInSeconds"] = relay_status["expiresInSeconds"]
-                return _json_response(200, payload)
+    def model_route(method: str, upstream_path: str) -> Handler:
+        target_url = urljoin(upstream_base, upstream_path)
 
-            if path == "/_internal/token" and relay_store is not None:
-                if request.method != "POST":
-                    extra_headers["allow"] = "POST"
-                    raise RequestError(405, "invalid_request_error", "Method not allowed.")
-                secret = request.headers.get("x-relay-secret")
-                if not isinstance(secret, str):
-                    raise RequestError(401, "authentication_error", "Missing relay ingest secret.")
-                assert relay_ingest_secret is not None
-                _require_secret(secret, relay_ingest_secret, "Invalid relay ingest secret.")
-                _, parsed = await _read_json_body(request, 64 * 1024, timeout_sec)
-                info = await relay_store.set_token(parsed.get("token"))
-                return _json_response(
-                    200, {"status": "updated", "tokenExpiresOn": info["expiresOn"]}
-                )
-
-            route = ROUTES.get(path)
-            if route is None:
-                raise RequestError(404, "not_found_error", "Unknown API route.")
-            if request.method != route.method:
-                extra_headers["allow"] = route.method
-                raise RequestError(405, "invalid_request_error", "Method not allowed.")
-
-            token = _caller_token(request)
-            if token_provider is not None:
-                assert local_api_key is not None
-                _require_secret(token, local_api_key, "Invalid local gateway key.")
-                try:
-                    provided = token_provider()
-                    if inspect.isawaitable(provided):
-                        provided = await provided
-                    token = provided
-                except RequestError:
-                    raise
-                except Exception as exc:
-                    raise RequestError(
-                        401,
-                        "authentication_error",
-                        "Upstream token is unavailable or expired. "
-                        "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。",
-                    ) from exc
-                if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
-                    raise RequestError(
-                        401, "authentication_error", "No valid upstream access token is available."
-                    )
-
+        async def forward(request: web.Request) -> web.StreamResponse:
+            token = relay_store.get_token()
             body = None
-            if route.method == "POST":
+            if method == "POST":
                 body, _ = await _read_json_body(request, body_limit, timeout_sec)
-            target_url = urljoin(upstream_base, route.upstream_path)
             return await _forward(request, target_url, token, body, timeout_sec)
-        except RequestError as exc:
-            return _json_response(
-                exc.status,
-                {"type": "error", "error": {"type": exc.error_type, "message": exc.message}},
-                headers=extra_headers,
-            )
-        except Exception:  # noqa: BLE001
-            return _json_response(
-                400,
-                {
-                    "type": "error",
-                    "error": {"type": "invalid_request_error", "message": "Invalid request."},
-                },
-            )
 
-    app = web.Application(client_max_size=0)
-    app.cleanup_ctx.append(http_client)
-    app.router.add_route("*", "/{tail:.*}", handle_all)
+        return forward
+
+    app = web.Application(client_max_size=0, middlewares=[_local_api_middleware])
+    app.cleanup_ctx.append(_http_client)
+    app.router.add_route("GET", "/healthz", healthz)
+    app.router.add_route("POST", "/_internal/token", ingest_token)
+    for path, (method, upstream_path) in MODEL_ROUTES.items():
+        app.router.add_route(method, path, model_route(method, upstream_path))
     return app
 
 
-async def serve_gateway(mode: str = "passthrough", port: int | None = None) -> int:
-    """Run the gateway server in the given mode ('passthrough' or 'relay')."""
-    if port is None:
-        raw_port = os.environ.get("PORT", "19324")
-        try:
-            port = int(raw_port)
-        except ValueError:
-            print("PORT must be an integer between 1 and 65535.", file=sys.stderr)
-            return 1
-    if port < 1 or port > 65535:
-        print("PORT must be an integer between 1 and 65535.", file=sys.stderr)
-        return 1
-
-    kwargs: dict[str, Any] = {}
-    if mode == "relay":
-        local_api_key = os.environ.get("LOCAL_GATEWAY_KEY", "")
-        if len(local_api_key) < 32:
-            print(
-                "Set LOCAL_GATEWAY_KEY to a random local-only key of at least 32 characters.",
-                file=sys.stderr,
-            )
-            return 1
-        kwargs["local_api_key"] = local_api_key
-
-        relay_ingest_secret = os.environ.get("RELAY_INGEST_SECRET", "")
-        if len(relay_ingest_secret) < 32:
-            print(
-                "Set RELAY_INGEST_SECRET to a random internal secret of at least 32 characters.",
-                file=sys.stderr,
-            )
-            return 1
-        token_file = Path(os.environ.get("RELAY_TOKEN_FILE") or Path(".local") / "token.dpapi")
-        relay_store = RelayTokenStore(token_file=token_file)
-        if await relay_store.load_cached():
-            st = relay_store.status()
-            print(
-                f"Loaded DPAPI-protected cached token "
-                f"(valid={st['hasToken']}, exp={st['tokenExpiresOn'] or 'unknown'}).",
-                flush=True,
-            )
-        kwargs["relay_store"] = relay_store
-        kwargs["relay_ingest_secret"] = relay_ingest_secret
-        kwargs["auth_mode"] = "copilot-token-relay"
-        kwargs["token_provider"] = relay_store.get_token
-
-    app = create_app(**kwargs)
+@asynccontextmanager
+async def listen(app: web.Application, port: int) -> AsyncGenerator[web.AppRunner, None]:
+    """Run an app on IPv4 loopback; port 0 lets the OS select a free port."""
     runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", port)
     try:
-        await site.start()
-    except OSError as exc:
-        await runner.cleanup()
-        if exc.errno in (98, 10048):
-            print("Loopback port is already in use.", file=sys.stderr)
-        else:
-            print("Gateway failed to start.", file=sys.stderr)
-        return 1
-
-    print(f"Messages endpoint: http://127.0.0.1:{port}/v1/messages", flush=True)
-    instructions = {
-        "relay": "Use the local gateway key in VS Code. Copilot App requests update the upstream token.",
-        "passthrough": "Caller must supply a valid upstream access token; no tokens are acquired or stored.",
-    }
-    print(instructions[mode], flush=True)
-
-    stop_event = asyncio.Event()
-    try:
-        await stop_event.wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", port).start()
+        yield runner
     finally:
         await runner.cleanup()
-    return 0

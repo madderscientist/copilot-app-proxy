@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 
 import pytest
@@ -29,33 +28,9 @@ def test_dpapi_roundtrip_and_file_persistence(tmp_path):
     assert secret not in raw
     assert load_protected_text(dpapi_file) == secret
 
-    # Tolerate UTF-8 BOM written by PowerShell [IO.File]::WriteAllText(..., UTF8)
+    # Tolerate a UTF-8 BOM in files written by older PowerShell tooling.
     dpapi_file.write_bytes(b"\xef\xbb\xbf" + raw.encode("utf-8"))
     assert load_protected_text(dpapi_file) == secret
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
-def test_dpapi_compatible_with_powershell_protected_data(tmp_path):
-    """Ensure Python DPAPI files can be decrypted by PowerShell ProtectedData and vice versa."""
-    secret = "cross-compat-gateway-key-0123456789abcdef"
-    dpapi_file = tmp_path / "gateway-key.dpapi"
-    save_protected_text(dpapi_file, secret)
-
-    ps_cmd = (
-        "Add-Type -AssemblyName System.Security; "
-        f"$enc = (Get-Content -Raw -LiteralPath '{dpapi_file}').Trim(); "
-        "$bytes = [Security.Cryptography.ProtectedData]::Unprotect("
-        "[Convert]::FromBase64String($enc), $null, "
-        "[Security.Cryptography.DataProtectionScope]::CurrentUser); "
-        "[Console]::Out.Write([Text.Encoding]::UTF8.GetString($bytes))"
-    )
-    res = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert res.stdout == secret
 
 
 def test_dpapi_rejects_empty_or_invalid_payload():

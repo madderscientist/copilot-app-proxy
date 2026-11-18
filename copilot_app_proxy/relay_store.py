@@ -1,4 +1,4 @@
-"""Token cache and request error types for Copilot App relay mode."""
+"""DPAPI-backed cache for the upstream token captured from Copilot App."""
 
 from __future__ import annotations
 
@@ -13,16 +13,23 @@ from typing import Any
 from copilot_app_proxy.dpapi import DpapiError, load_protected_text, save_protected_text
 
 TOKEN_PATTERN = re.compile(r"^[^\s,\x00-\x1f\x7f]{1,32768}$")
+CAPTURE_HINT = "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。"
 
 
-class RequestError(Exception):
-    """HTTP error with Anthropic-compatible JSON payload metadata."""
+class TokenError(Exception):
+    """Base class for relay token failures."""
 
-    def __init__(self, status: int, error_type: str, message: str) -> None:
-        super().__init__(message)
-        self.status = status
-        self.error_type = error_type
-        self.message = message
+
+class InvalidTokenError(TokenError):
+    """The submitted token does not match the accepted token format."""
+
+
+class TokenPersistError(TokenError):
+    """The token could not be written to the DPAPI cache."""
+
+
+class TokenUnavailableError(TokenError):
+    """No usable token has been captured yet, or the captured one has expired."""
 
 
 def decode_jwt_exp(token: str) -> datetime | None:
@@ -33,7 +40,7 @@ def decode_jwt_exp(token: str) -> datetime | None:
     try:
         padded = parts[1] + "=" * (-len(parts[1]) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    except ValueError:
         return None
     exp = payload.get("exp") if isinstance(payload, dict) else None
     if isinstance(exp, (int, float)) and not isinstance(exp, bool):
@@ -77,33 +84,26 @@ class RelayTokenStore:
     async def set_token(self, token: Any) -> dict[str, str | None]:
         """Validate, store in memory, and persist token to DPAPI file."""
         if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
-            raise RequestError(400, "invalid_request_error", "Invalid token format.")
+            raise InvalidTokenError("Invalid token format.")
         async with self._lock:
             if token != self._token:
                 expires_on = decode_jwt_exp(token)
                 # Commit memory only after persistence succeeds, so a failed write can be retried.
                 if self._token_file is not None:
-                    await asyncio.to_thread(save_protected_text, self._token_file, token)
+                    try:
+                        await asyncio.to_thread(save_protected_text, self._token_file, token)
+                    except (OSError, DpapiError) as exc:
+                        raise TokenPersistError("Could not persist the relay token.") from exc
                 self._token = token
                 self._expires_on = expires_on
             return {"expiresOn": _format_iso(self._expires_on)}
 
     def get_token(self) -> str:
-        """Return active upstream token or raise RequestError(401) if missing/expired."""
+        """Return the active upstream token or raise TokenUnavailableError."""
         if not self._token:
-            raise RequestError(
-                401,
-                "authentication_error",
-                "No Copilot upstream token captured yet. "
-                "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。",
-            )
+            raise TokenUnavailableError(f"No Copilot upstream token captured yet. {CAPTURE_HINT}")
         if self._expires_on is not None and self._expires_on <= datetime.now(UTC):
-            raise RequestError(
-                401,
-                "authentication_error",
-                "Captured Copilot token has expired. "
-                "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。",
-            )
+            raise TokenUnavailableError(f"Captured Copilot token has expired. {CAPTURE_HINT}")
         return self._token
 
     def status(self) -> dict[str, Any]:

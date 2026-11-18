@@ -27,16 +27,12 @@ if (-not $python) {
     throw 'Python 3.12 or later is required. Install Python or pass -PythonExecutable with its full path.'
 }
 
-$venv = Join-Path $repoRoot '.venv'
-$venvPython = Join-Path $venv 'Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $venvPython)) {
-    & $python -m venv $venv
-    if ($LASTEXITCODE -ne 0) { throw 'Could not create the project Python environment.' }
+$cliArgs = @('-m', 'copilot_app_proxy.cli', 'install')
+if ($PythonIndexUrl) { $cliArgs += @('--index-url', $PythonIndexUrl) }
+Push-Location -LiteralPath $repoRoot
+try {
+    & $python @cliArgs
+    exit $LASTEXITCODE
+} finally {
+    Pop-Location
 }
-$pipArguments = @('-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'off', '-e', $repoRoot)
-if ($PythonIndexUrl) { $pipArguments += @('--index-url', $PythonIndexUrl) }
-& $venvPython @pipArguments
-if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python dependencies.' }
-
-Write-Host 'Installation complete. No certificates, proxy settings, or accounts were changed.' -ForegroundColor Green
-Write-Host 'Start with: .\start-transparent-proxy.ps1 -CopyKey'
