@@ -32,7 +32,7 @@ Set-Location copilot-app-proxy
 .\install.ps1
 ```
 
-安装脚本创建项目内的 `.venv/`，从 `pyproject.toml` 安装固定版本 mitmproxy、aiohttp 和 msal，并可编辑安装 `copilot-app-proxy`。它不修改全局 Python 配置，不安装证书、不启动代理或重启 Copilot。
+安装脚本创建项目内的 `.venv/`，从 `pyproject.toml` 安装固定版本 mitmproxy 和 aiohttp，并可编辑安装 `copilot-app-proxy`。它不修改全局 Python 配置，不安装证书、不启动代理或重启 Copilot。
 
 如果自动检测不到 Python，可指定真实解释器，不能使用 Windows 商店的空占位入口：
 
@@ -180,8 +180,6 @@ Invoke-RestMethod http://127.0.0.1:19324/healthz
 
 ## 其他运行模式
 
-透明中继不要求另行注册 Entra 应用。以下模式是保留的可选入口，不是透明中继的前置步骤。
-
 ### 调用方提供令牌
 
 ```powershell
@@ -189,19 +187,6 @@ Invoke-RestMethod http://127.0.0.1:19324/healthz
 ```
 
 每次请求使用 `Authorization: Bearer <上游访问令牌>` 或 `x-api-key: <上游访问令牌>`，二者只能选一个。此模式不会获取或刷新令牌；Azure 管理 API 令牌、GitHub 令牌或任意本机密钥不能替代目标资源令牌。
-
-### 独立微软浏览器登录
-
-```powershell
-$env:ENTRA_CLIENT_ID = '自己的公共客户端 ID'
-$env:ENTRA_TENANT_ID = '组织租户 ID'
-$env:LOCAL_GATEWAY_KEY = [Guid]::NewGuid().ToString('N')
-.\.venv\Scripts\python.exe -m copilot_app_proxy --login
-```
-
-该模式使用官方 MSAL，在微软浏览器窗口完成登录并在进程内静默刷新，重启后需要重新登录。它要求自己的有效单租户公共客户端注册、`http://localhost` 回调地址，以及 Microsoft FX Gateway 的 `LLM.Read` 委托权限。最小权限清单位于 `entra-permissions.json`。
-
-独立客户端的注册和授权取决于组织策略，不能假定普通 Azure CLI 登录可取得此资源令牌。遇到 `AADSTS65002` 或 `ServiceManagementReference` 要求时，需要使用自己获准的客户端和真实的服务归属信息。此可选模式尚未完成真实端到端登录验证；相关背景见调查记录和 <https://aka.ms/service-management-reference-error>。
 
 ## 开发测试
 
@@ -225,14 +210,12 @@ copilot-app-proxy/
   stop-transparent-proxy.ps1      停止中继并恢复 Copilot
   status.ps1                      一键查看代理与令牌状态
   doctor.ps1                      一键诊断环境与端口问题
-  entra-permissions.json          可选登录的最小权限清单
   copilot_app_proxy/
     __main__.py                   CLI 入口（serve / status / doctor / key / vscode-config）
     gateway.py                    aiohttp 网关、SSE 流式转发与路由
     relay_store.py                内存与 DPAPI 令牌缓存及到期判断
     relay_addon.py                Copilot 请求令牌中继插件
     dpapi.py                      Windows DPAPI 原生加解密（crypt32.dll）
-    auth.py                       可选的 MSAL 独立登录
     cli_tools.py                  状态检查、环境诊断、密钥与 VS Code 配置生成
   tests/                          自动化测试套件
   .local/                         本机加密状态、日志与临时证书，禁止提交
@@ -293,10 +276,9 @@ flowchart LR
 | `relay_addon.py` | 定向提取访问令牌、向内部接口推送、成功后去重；不解析 JWT、不管理刷新 |
 | `gateway.py` / `relay_store.py` | 本机认证、接口路由、令牌缓存、请求头组装和 JSON/SSE 转发 |
 | `dpapi.py` | 用当前 Windows 用户身份（`crypt32.dll`）加解密本机缓存 |
-| `auth.py` | 仅在可选 `--login` 模式下使用官方 MSAL，不参与透明中继 |
 | `cli_tools.py` | 状态检查、环境诊断、密钥与 VS Code 配置生成 |
 
-三种模式最终都复用同一请求转发逻辑，仅令牌来源不同：`--relay` 从中继缓存读取，`--login` 从 MSAL 取得，默认模式使用调用方提供的上游令牌。
+两种模式最终都复用同一请求转发逻辑，仅令牌来源不同：`--relay` 从中继缓存读取，默认模式使用调用方提供的上游令牌。
 
 ### 密钥边界
 

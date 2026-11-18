@@ -19,7 +19,6 @@ from urllib.parse import urljoin, urlsplit
 import aiohttp
 from aiohttp import web
 
-from copilot_app_proxy.auth import EntraSession, config_from_environment, sign_in_error_summary
 from copilot_app_proxy.relay_store import TOKEN_PATTERN, RelayTokenStore, RequestError
 
 DEFAULT_UPSTREAM = "https://loki.delve.office.com/api/v1/llmapi/"
@@ -305,7 +304,9 @@ def create_app(
         raise ValueError("Invalid upstream base URL.")
 
     timeout_sec = timeout_ms / 1000.0
-    effective_auth_mode = auth_mode or ("entra-msal" if token_provider else "caller-provided-upstream-token")
+    effective_auth_mode = auth_mode or (
+        "local-gateway-key" if token_provider else "caller-provided-upstream-token"
+    )
 
     async def on_startup(app: web.Application) -> None:
         connector = aiohttp.TCPConnector(limit=64)
@@ -370,8 +371,8 @@ def create_app(
                     raise RequestError(
                         401,
                         "authentication_error",
-                        "Upstream sign-in or refresh failed. "
-                        "Restart the gateway with --login and complete supported sign-in.",
+                        "Upstream token is unavailable or expired. "
+                        "Trigger a request in Copilot App to refresh it.",
                     ) from exc
                 if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
                     raise RequestError(
@@ -405,7 +406,7 @@ def create_app(
 
 
 async def serve_gateway(mode: str = "passthrough", port: int | None = None) -> int:
-    """Run the gateway server in the given mode ('passthrough', 'relay', or 'login')."""
+    """Run the gateway server in the given mode ('passthrough' or 'relay')."""
     if port is None:
         raw_port = os.environ.get("PORT", "19324")
         try:
@@ -418,7 +419,7 @@ async def serve_gateway(mode: str = "passthrough", port: int | None = None) -> i
         return 1
 
     kwargs: dict[str, Any] = {}
-    if mode != "passthrough":
+    if mode == "relay":
         local_api_key = os.environ.get("LOCAL_GATEWAY_KEY", "")
         if len(local_api_key) < 32:
             print(
@@ -428,7 +429,6 @@ async def serve_gateway(mode: str = "passthrough", port: int | None = None) -> i
             return 1
         kwargs["local_api_key"] = local_api_key
 
-    if mode == "relay":
         relay_ingest_secret = os.environ.get("RELAY_INGEST_SECRET", "")
         if len(relay_ingest_secret) < 32:
             print(
@@ -449,32 +449,6 @@ async def serve_gateway(mode: str = "passthrough", port: int | None = None) -> i
         kwargs["relay_ingest_secret"] = relay_ingest_secret
         kwargs["auth_mode"] = "copilot-token-relay"
         kwargs["token_provider"] = relay_store.get_token
-    elif mode == "login":
-        try:
-            config = config_from_environment()
-        except ValueError:
-            print(
-                "Set ENTRA_CLIENT_ID and ENTRA_TENANT_ID to your own registered public-client IDs.",
-                file=sys.stderr,
-            )
-            return 1
-        session = EntraSession(config)
-        print(
-            "Opening Microsoft sign-in. Complete authentication in your browser; "
-            "do not paste tokens into this terminal.",
-            flush=True,
-        )
-        try:
-            status = await asyncio.to_thread(session.sign_in)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Sign-in/startup failed: {sign_in_error_summary(exc)}", file=sys.stderr)
-            return 1
-        print(
-            f"Microsoft sign-in completed. Token expiry: {status['expiresOn'] or 'unknown'}. "
-            "Upstream API access still requires verification.",
-            flush=True,
-        )
-        kwargs["token_provider"] = lambda: asyncio.to_thread(session.get_access_token)
 
     app = create_app(**kwargs)
     runner = web.AppRunner(app, access_log=None)
@@ -493,8 +467,7 @@ async def serve_gateway(mode: str = "passthrough", port: int | None = None) -> i
     print(f"Messages endpoint: http://127.0.0.1:{port}/v1/messages", flush=True)
     instructions = {
         "relay": "Use the local gateway key in VS Code. Copilot App requests update the upstream token.",
-        "login": "Use the local gateway key in VS Code. MSAL handles upstream refresh in memory.",
-        "passthrough": "Caller must supply a valid upstream Entra access token; no tokens are acquired or stored.",
+        "passthrough": "Caller must supply a valid upstream access token; no tokens are acquired or stored.",
     }
     print(instructions[mode], flush=True)
 

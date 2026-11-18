@@ -27,16 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
     # `serve` subcommand (and top-level flags for backwards compatibility)
     serve_parser = subparsers.add_parser("serve", help="Run the local Messages API gateway.")
     for target in (parser, serve_parser):
-        mode_group = target.add_mutually_exclusive_group()
-        mode_group.add_argument(
+        target.add_argument(
             "--relay",
             action="store_true",
             help="Run gateway in Copilot App token relay mode.",
-        )
-        mode_group.add_argument(
-            "--login",
-            action="store_true",
-            help="Run gateway with interactive Microsoft Entra browser sign-in.",
         )
         target.add_argument(
             "--port",
@@ -90,7 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "vscode-config":
         return run_vscode_config(port=args.port)
 
-    mode = "relay" if args.relay else "login" if args.login else "passthrough"
+    mode = "relay" if args.relay else "passthrough"
     try:
         return asyncio.run(serve_gateway(mode=mode, port=args.port))
     except KeyboardInterrupt:

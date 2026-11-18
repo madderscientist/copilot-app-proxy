@@ -5,10 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import re
-import subprocess
-import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -248,24 +245,8 @@ async def test_unresponsive_upstream_times_out_without_leaking_credentials():
         assert SYNTHETIC_TOKEN not in text
 
 
-def test_login_command_stops_before_browser_signin_when_env_missing():
-    env = {**os.environ, "LOCAL_GATEWAY_KEY": "", "ENTRA_CLIENT_ID": "", "ENTRA_TENANT_ID": ""}
-    res = subprocess.run(
-        [sys.executable, "-m", "copilot_app_proxy", "--login"],
-        check=False,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    assert res.returncode == 1
-    assert "LOCAL_GATEWAY_KEY" in res.stderr
-    assert "Opening Microsoft sign-in" not in res.stdout
-    assert "Messages endpoint:" not in res.stdout
-
-
 @pytest.mark.asyncio
-async def test_managed_login_validates_local_key_and_injects_provider_token():
+async def test_token_provider_validates_local_key_and_injects_upstream_token():
     provider_calls = 0
     upstream_auth: str | None = None
 
@@ -297,11 +278,11 @@ async def test_managed_login_validates_local_key_and_injects_provider_token():
         assert LOCAL_KEY not in (upstream_auth or "")
 
         async with client.get(f"{url}/healthz") as health:
-            assert (await health.json())["authentication"] == "entra-msal"
+            assert (await health.json())["authentication"] == "local-gateway-key"
 
 
 @pytest.mark.asyncio
-async def test_managed_login_fails_closed_on_refresh_errors():
+async def test_token_provider_fails_closed_on_errors():
     upstream_calls = 0
 
     async def handler(_request: web.Request) -> web.Response:
