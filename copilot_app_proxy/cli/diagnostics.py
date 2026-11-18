@@ -15,6 +15,11 @@ from . import windows
 from .config import active_ports, find_mitmdump_executable, local_dir, read_pids
 
 DEFAULT_MODEL_ID = "claude-opus-5.5"
+# Probed against the upstream: /v1/models reports the context window and effort levels;
+# max_tokens above 128000 is rejected. Only adaptive thinking is accepted.
+CONTEXT_WINDOW = 1_000_000
+MAX_OUTPUT_TOKENS = 128_000
+REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 
 def fetch_healthz(port: int) -> dict[str, Any] | None:
@@ -64,8 +69,11 @@ def build_vscode_config(port: int) -> list[dict[str, Any]]:
                     "apiType": "messages",
                     "toolCalling": True,
                     "vision": False,
-                    "contextWindow": 1000000,
-                    "maxOutputTokens": 32768,
+                    "thinking": True,
+                    "adaptiveThinking": True,
+                    "supportsReasoningEffort": list(REASONING_EFFORTS),
+                    "contextWindow": CONTEXT_WINDOW,
+                    "maxOutputTokens": MAX_OUTPUT_TOKENS,
                 }
             ],
         }

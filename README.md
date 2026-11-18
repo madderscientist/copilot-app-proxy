@@ -133,18 +133,27 @@ git pull --ff-only
     "models": [
       {
         "id": "claude-opus-5.5",
-        "name": "claude-opus-5.5",
+        "name": "claude-opus-5.5 (本机代理)",
         "url": "http://127.0.0.1:19324/v1/messages",
         "apiType": "messages",
         "toolCalling": true,
         "vision": false,
+        "thinking": true,
+        "adaptiveThinking": true,
+        "supportsReasoningEffort": ["low", "medium", "high", "xhigh", "max"],
         "contextWindow": 1000000,
-        "maxOutputTokens": 32768
+        "maxOutputTokens": 128000
       }
     ]
   }
 ]
 ```
+
+### 思考强度与上限
+
+- 思考强度在 VS Code 模型选择器的 **Effort Level** 中切换，请求以 `output_config.effort` 发送，可选 `low`、`medium`、`high`、`xhigh`、`max`。直接调用接口时在请求体中加入 `"output_config": {"effort": "high"}` 即可。
+- 上游只接受 `"thinking": {"type": "adaptive"}`；`enabled` 加 `budget_tokens` 和 `disabled` 都会返回 400。不传 `thinking` 时模型同样会自适应思考。
+- 上下文窗口 1000000 来自 `GET /v1/models` 的 `capabilities.limits.max_context_window_tokens`，支持的强度档位也在 `capabilities.supports.reasoning_effort` 中。最大输出 128000 是实测值：模型列表不返回该字段，`max_tokens` 超过 128000 会被拒绝。
 
 ## 令牌与安全边界
 
@@ -171,7 +180,8 @@ Invoke-RestMethod http://127.0.0.1:19324/healthz
 | `GET /healthz` | 健康检查与令牌到期状态，不返回令牌 |
 | `GET /v1/models` | 获取上游模型列表 |
 | `POST /v1/messages` | Messages 请求，支持 SSE 流式响应 |
-| `POST /v1/messages/count_tokens` | 转发计数请求，上游支持情况尚未验证 |
+
+上游没有 `count_tokens` 接口（返回 `NonExistentApi`），网关不提供该路由。
 
 生产上游固定为 `https://loki.delve.office.com/api/v1/llmapi/`。代理补齐必需的客户端、会话和 API 版本请求头，API 版本默认使用已验证的 `2026-10-21`；上游更新后可能需要调整。
 

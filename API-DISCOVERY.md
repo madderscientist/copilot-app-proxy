@@ -195,13 +195,19 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 - Copilot App 的真实模型请求使用上述域名、路径和模型 ID，并返回成功的 SSE 响应。
 - 本人会话的访问令牌在当时条件下可以用于本机网关发起的独立模型列表和最小 Messages 请求。
 - 本地测试覆盖请求体和工具定义原样转发、SSE 首段及时到达、认证隔离、错误透传、DPAPI 缓存及中继失败后的重试。
+- 经本机网关对 `claude-opus-5.5` 实测的推理选项和上限：
+  - `GET models` 返回 `capabilities.limits.max_context_window_tokens`（1000000）和 `capabilities.supports.reasoning_effort`（`low`、`medium`、`high`、`xhigh`、`max`），不返回最大输出。
+  - `max_tokens` 为 128000 时成功，128001 起返回 400 `invalid_body`。
+  - `output_config.effort` 接受上述五档，其他值返回 400；`max` 档的思考 token 明显增多。
+  - `thinking` 只接受 `{"type": "adaptive"}`，`enabled` 加 `budget_tokens` 与 `disabled` 均返回 400；省略时响应仍包含思考块。
+  - `v1/messages/count_tokens` 返回 404 `NonExistentApi`，上游不提供该接口。
 
 未作保证：
 
 - 所有账号、组织、设备或未来应用版本都支持同样的调用方式。
 - API 是公开、稳定或不受客户端与组织政策限制的服务。
-- VS Code 的完整 agent 工作流、所有工具、图片、推理选项和模型上限都已端到端验证。
-- `/v1/messages/count_tokens` 已获得上游支持。
+- VS Code 的完整 agent 工作流、所有工具和图片输入都已端到端验证。
+- 上述上限与推理选项同样适用于其他模型或未来版本。
 - 健康检查显示缓存令牌未过期，就意味着上游一定接受它。
 
 ## 十、当前代码与后续维护

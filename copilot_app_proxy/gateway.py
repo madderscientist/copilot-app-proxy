@@ -32,7 +32,6 @@ CLIENT_SESSION_KEY = web.AppKey("http_client", aiohttp.ClientSession)
 # Local path -> (method, upstream path relative to the upstream base URL).
 MODEL_ROUTES = {
     "/v1/messages": ("POST", "v1/messages"),
-    "/v1/messages/count_tokens": ("POST", "v1/messages/count_tokens"),
     "/v1/models": ("GET", "models"),
 }
 
