@@ -202,7 +202,7 @@ def run_status(root: Path, gateway_port: int | None = None) -> int:
         if not authenticated:
             print("  -> 运行 copilot-proxy refresh，或在 Copilot App 的 Code 页发送一条消息。")
     elif pids or ca_trusted:
-        print("  -> 上次运行没有完整清理：运行 copilot-proxy stop 移除临时 CA 并恢复 Copilot App。")
+        print("  -> 上次运行没有完整清理：运行 copilot-proxy stop 移除临时 CA 并关闭 Copilot App。")
     else:
         print("  -> 运行 copilot-proxy start 启动代理。")
     return 0 if health else 1

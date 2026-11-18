@@ -230,7 +230,7 @@ def describe(
 
 
 def _install_close_handler(root: Path) -> Any:
-    """Restore Copilot App if the console window is closed instead of using Ctrl+C."""
+    """Stop keep-alive, Copilot App, and the proxy if the console window is closed."""
     import ctypes
     from ctypes import wintypes
 
@@ -240,7 +240,7 @@ def _install_close_handler(root: Path) -> Any:
     def handler(event: int) -> bool:
         if event not in close_events:
             return False  # Ctrl+C / Ctrl+Break fall through to Python's KeyboardInterrupt.
-        launcher._restore_quickly(root)
+        launcher._stop_quickly(root)
         return True
 
     ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)

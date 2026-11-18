@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log request metadata (no tokens) to .local\\logs\\observe.jsonl.",
     )
 
-    subparsers.add_parser("stop", help="Stop the proxy and restore Copilot App.")
+    subparsers.add_parser("stop", help="Stop the proxy, remove the CA, and close Copilot App.")
     status = subparsers.add_parser("status", help="Show proxy, CA, and token status.")
     doctor = subparsers.add_parser("doctor", help="Diagnose environment and proxy setup.")
     vscode = subparsers.add_parser("vscode-config", help="Print VS Code Custom Endpoint JSON.")

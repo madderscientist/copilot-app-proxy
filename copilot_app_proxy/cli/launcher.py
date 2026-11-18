@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 import shutil
@@ -24,8 +25,8 @@ GATEWAY_MARKER = f"-m {CLI_MODULE} serve --port "
 KEEPALIVE_MARKER = f"-m {CLI_MODULE} keepalive "
 
 
-def _field(label: str, value: str, color: str) -> None:
-    print(f"{ansi.paint(f'{label}:'.ljust(9), ansi.BOLD)}{ansi.paint(value, color)}", flush=True)
+def _field(label: str, value: str) -> None:
+    print(f"{ansi.paint(f'{label}:'.ljust(9), ansi.BOLD)}{value}", flush=True)
 
 
 def _warn(message: str) -> None:
@@ -46,7 +47,7 @@ def _kill_tree(pid: int) -> None:
 
 
 def _stop_workers(state: dict[str, Any]) -> None:
-    if not state or (state.keys() == {"copilotPath"} and isinstance(state["copilotPath"], str)):
+    if not state:
         return
     expected: dict[int, str] = {}
     for key, marker in (("gatewayPid", GATEWAY_MARKER), ("mitmPid", str(ADDON_PATH).casefold())):
@@ -88,21 +89,20 @@ def _stop_app(apps: list[windows.AppProcess], timeout: float = 8) -> None:
         time.sleep(0.1)
 
 
-def _launch_app(path: Path, proxy_port: int | None = None) -> None:
+def _launch_app(path: Path, proxy_port: int) -> None:
+    # --proxy-server covers the pages; model API calls come from children using HTTP(S)_PROXY.
+    proxy = f"http://127.0.0.1:{proxy_port}"
     env = os.environ.copy()
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "RELAY_INGEST_SECRET"):
+    for name in ("ALL_PROXY", "RELAY_INGEST_SECRET"):
         env.pop(name, None)
-    args = [str(path)]
-    if proxy_port is not None:
-        proxy = f"http://127.0.0.1:{proxy_port}"
-        env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, NO_PROXY="localhost,127.0.0.1,::1")
-        args += [f"--proxy-server={proxy}", "--disable-quic"]
+    env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, NO_PROXY="localhost,127.0.0.1,::1")
     subprocess.Popen(
-        args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        [str(path), f"--proxy-server={proxy}", "--disable-quic"],
+        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
 
-def _cleanup(local: Path, *, restore: bool, keep_records: bool = False) -> None:
+def _cleanup(local: Path, *, close_app: bool, keep_records: bool = False) -> None:
     thumb_file = local / "ca-thumbprint.txt"
     if thumb_file.exists():
         windows.remove_ca(thumb_file.read_text(encoding="ascii").strip())
@@ -111,21 +111,10 @@ def _cleanup(local: Path, *, restore: bool, keep_records: bool = False) -> None:
         shutil.rmtree(ca_dir)
 
     if keep_records:
-        print("Run 'copilot-proxy stop' to restore the previous session.", file=sys.stderr)
+        print("Run 'copilot-proxy stop' to clean up the previous session.", file=sys.stderr)
         return
-    if restore:
-        apps = windows.copilot_processes()
-        recorded = read_pids(local).get("copilotPath")
-        app = Path(recorded) if isinstance(recorded, str) else None
-        if app is None or not app.is_file():
-            app = _app_path(apps)
-        if app is None or not app.is_file():
-            raise FileNotFoundError("Cannot restore Copilot App: copilotapp.exe not found.")
-        # Keep the executable path for retry even after the process has exited.
-        write_pids(local, copilotPath=str(app.resolve()))
-        _stop_app(apps)
-        _launch_app(app)
-        print(ansi.paint("Copilot App restored without the proxy.", ansi.GREEN))
+    if close_app:  # Its proxy settings are fixed at launch; it cannot work without the proxy.
+        _stop_app(windows.copilot_processes())
     thumb_file.unlink(missing_ok=True)
     (local / "pids.json").unlink(missing_ok=True)
 
@@ -195,8 +184,12 @@ def start(
         raise ValueError("Gateway and proxy ports must be different.")
     with windows.lifecycle_lock(local_dir(root)):
         _start_locked(root, gateway_port, proxy_port, mitmproxy_path, copilot_path, observe)
-    _field("Gateway", f"http://127.0.0.1:{gateway_port}/v1/messages", ansi.CYAN)
-    _field("Proxy", f"http://127.0.0.1:{proxy_port}", ansi.CYAN)
+    from copilot_app_proxy.gateway import MODEL_ROUTES  # Needs aiohttp, absent before install.
+
+    gateway = f"http://127.0.0.1:{gateway_port}"
+    routes = ansi.paint(' '.join(MODEL_ROUTES), ansi.DIM)
+    _field("Gateway", f"{ansi.paint(gateway, ansi.CYAN)}  {routes}")
+    _field("Proxy", ansi.paint(f"http://127.0.0.1:{proxy_port}", ansi.CYAN))
     # The first Code tab visit after launch makes Copilot App fetch models with its token.
     if windows.select_code_tab():
         _report_token(gateway_port)
@@ -238,10 +231,11 @@ def _report_token(gateway_port: int, timeout: float = 20) -> None:
     while True:
         health = fetch_healthz(gateway_port) or {}
         if health.get("upstreamAuthenticated"):
-            _field("Token", f"ready (exp={health.get('tokenExpiresOn') or 'unknown'})", ansi.GREEN)
+            expires = health.get('tokenExpiresOn') or 'unknown'
+            _field("Token", ansi.paint(f"ready (exp={expires})", ansi.GREEN))
             return
         if time.monotonic() >= deadline:
-            _field("Token", "not captured yet; open Copilot App's Code tab.", ansi.YELLOW)
+            _field("Token", ansi.paint("not captured yet; open Copilot App's Code tab.", ansi.YELLOW))
             return
         time.sleep(1)
 
@@ -290,7 +284,7 @@ def _start_locked(
     }
     if observe:
         mitm_env["RELAY_OBSERVE_LOG"] = str(local / "logs" / "observe.jsonl")
-    restart_needed = False
+    app_touched = False
     try:
         workers["gateway"] = _launch_worker(
             gateway_args, root, "gateway", {"RELAY_INGEST_SECRET": secret}, own_log=True
@@ -321,7 +315,7 @@ def _start_locked(
         thumb = windows.ca_thumbprint(cert)
         thumb_file.write_text(thumb, encoding="ascii")
         windows.trust_ca(cert, thumb)
-        restart_needed = bool(apps)
+        app_touched = True
         _stop_app(apps)
         _launch_app(app, proxy_port)
     except BaseException:
@@ -330,7 +324,7 @@ def _start_locked(
                 if worker.poll() is None:
                     _kill_tree(worker.pid)
             _cleanup(
-                local, restore=restart_needed, keep_records=previous_session and not restart_needed
+                local, close_app=app_touched, keep_records=previous_session and not app_touched
             )
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             print(
@@ -340,25 +334,21 @@ def _start_locked(
         raise
 
 
-def _restore_quickly(root: Path) -> None:
-    """Best-effort restore within the ~5 s Windows allows when the console is closed.
+def _stop_quickly(root: Path) -> None:
+    """Best-effort stop within the ~5 s Windows allows when the console is closed.
 
-    Copilot App is relaunched without the proxy first so it keeps working; the trusted CA
-    and process records stay for a later `stop` to finish, since CA removal needs a prompt.
+    Keep-alive goes first so it cannot relaunch Copilot App, then the App, then the proxy.
+    The trusted CA and process records stay for a later `stop`, since CA removal prompts.
     """
     state = read_pids(local_dir(root))
-    try:
-        app = Path(state["copilotPath"])
-        _stop_app(windows.copilot_processes(), timeout=2)
-        _launch_app(app)
-    except (KeyError, OSError, RuntimeError, subprocess.SubprocessError):
-        pass
-    for key in ("keepalivePid", "gatewayPid", "mitmPid"):
-        if type(pid := state.get(key)) is int and pid > 0:
-            try:
-                _kill_tree(pid)
-            except (OSError, RuntimeError, subprocess.SubprocessError):
-                pass
+    for step in (
+        lambda: _kill_tree(state["keepalivePid"]),
+        lambda: _stop_app(windows.copilot_processes(), timeout=2),
+        lambda: _kill_tree(state["gatewayPid"]),
+        lambda: _kill_tree(state["mitmPid"]),
+    ):
+        with contextlib.suppress(KeyError, OSError, RuntimeError, subprocess.SubprocessError):
+            step()
 
 
 def _stop_with_retry(root: Path, timeout: float = 30) -> int:
@@ -379,6 +369,6 @@ def stop(root: Path) -> int:
     with windows.lifecycle_lock(local):
         state = _read_runtime_state(local)
         _stop_workers(state)
-        _cleanup(local, restore=bool(state))
+        _cleanup(local, close_app=bool(state))
     print(ansi.paint("Proxy stopped and temporary CA removed.", ansi.GREEN))
     return 0

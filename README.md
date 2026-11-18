@@ -72,7 +72,7 @@ Set-Location copilot-app-proxy
 
 终端里会用颜色区分：来源各有颜色；状态码 2xx/3xx 为绿色、4xx 为黄色、5xx 为红色；令牌更新为绿色，重试、沿用旧令牌等提示为黄色，错误为红色。状态栏第一块显示令牌状态，底色为绿色（正常）、黄色（即将续期）或红色（没有可用令牌或网关无响应）；后面是自动续期状态（停止时显示黄色的 `keep-alive STOPPED`）和停止提示，用 `|` 分隔。请求是否成功直接看上方日志里状态码的颜色。设置环境变量 `NO_COLOR` 可关闭颜色。
 
-按 **Ctrl+C** 停止：结束所有进程、移除临时 CA（Windows 会弹出删除确认），并让 Copilot App 恢复直连。
+按 **Ctrl+C** 停止：结束所有进程、移除临时 CA（Windows 会弹出删除确认），并关闭 Copilot App。之后需要用 App 时正常打开即可，它会直接联网。
 
 ### 4. 接入 VS Code
 
@@ -91,7 +91,7 @@ Set-Location copilot-app-proxy
 | 命令 | 作用 |
 | --- | --- |
 | `start` | 启动代理并留在终端显示日志，Ctrl+C 停止 |
-| `stop` | 停止代理、移除临时 CA、恢复 Copilot App；也用于清理异常退出后的残留 |
+| `stop` | 停止代理、移除临时 CA、关闭 Copilot App；也用于清理异常退出后的残留 |
 | `status` | 查看网关、代理、自动续期、临时 CA 和令牌的状态 |
 | `refresh` | 立即重启 Copilot App 并打开 Code 页，尝试取得新令牌 |
 | `vscode-config` | 生成 VS Code 的 Custom Endpoint 配置 |
@@ -129,11 +129,13 @@ Set-Location copilot-app-proxy
 .\.venv\Scripts\copilot-proxy.exe stop
 ```
 
-在前台按 Ctrl+C 等同于 `stop`。移除临时 CA 时 Windows 会弹出确认；若取消，`stop` 会报错并保留记录，可再次执行。停止后会保留加密的令牌缓存 `.local/token.dpapi`，供下次启动使用。
+在前台按 Ctrl+C 等同于 `stop`。由 `start` 打开的 Copilot App 只能经代理联网，代理停止后它无法继续使用，所以 `stop` 会把它关闭，但不会自动重新打开；需要时自己打开即可，新打开的 App 会直接联网。
+
+移除临时 CA 时 Windows 会弹出确认；若取消，`stop` 会报错并保留记录，可再次执行。停止后会保留加密的令牌缓存 `.local/token.dpapi`，供下次启动使用。
 
 | 情况 | 结果与处理 |
 | --- | --- |
-| 直接关闭终端窗口 | 程序会结束后台进程，并让 Copilot App 恢复直连；但来不及移除临时 CA。之后 `status` 会提示运行 `stop` |
+| 直接关闭终端窗口 | 程序会依次结束自动续期、Copilot App 和代理；但来不及移除临时 CA。之后 `status` 会提示运行 `stop` |
 | 注销或关机 | 进程都会结束，下次登录 App 正常直连；临时 CA 仍在，运行 `stop` 清理 |
 | 后台进程被强行结束 | Copilot App 会因连不上代理而断网。运行 `stop`，或完全退出 Copilot App 后重新打开 |
 
@@ -174,7 +176,7 @@ git pull --ff-only
 .\install.ps1
 ```
 
-卸载时先运行 `stop`，确认临时 CA 已移除、Copilot App 已恢复直连，再删除整个项目目录。
+卸载时先运行 `stop`，确认临时 CA 已移除，再删除整个项目目录。
 
 ## 常见问题
 
@@ -331,7 +333,7 @@ flowchart LR
 | `copilot_app_proxy/dpapi.py` | 调用 Windows DPAPI 加解密 |
 | `cli/__main__.py` | 命令行参数与分发 |
 | `cli/launcher.py` | `start` / `stop`：进程编排、证书信任、Copilot App 重启与清理 |
-| `cli/foreground.py` | 前台视图：汇总各进程日志并着色、底部状态栏与窗口标题、关闭窗口时的快速恢复 |
+| `cli/foreground.py` | 前台视图：汇总各进程日志并着色、底部状态栏与窗口标题、关闭窗口时的快速停止 |
 | `cli/ansi.py` | 终端颜色：检测是否支持 ANSI、遵循 `NO_COLOR` |
 | `cli/keepalive.py` | `refresh` / `keepalive`：重启 App 并打开 Code 页以取得新令牌 |
 | `cli/windows.py` | Windows 进程查询、证书操作、启停锁与 Code 页的 UI 自动化 |

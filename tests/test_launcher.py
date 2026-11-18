@@ -36,16 +36,13 @@ def test_config_validation_and_doctor_overrides(tmp_path, monkeypatch, capsys):
         resolve_ports(tmp_path)
 
 
-@pytest.mark.parametrize("failure", [None, "not ready", "app launch failed", "restore failed"])
+@pytest.mark.parametrize("failure", [None, "not ready", "app launch failed"])
 @pytest.mark.usefixtures("simulated_platform")
 def test_managed_start_and_stop(tmp_path, monkeypatch, failure):
     exe = tmp_path / "desktop app.exe"
     exe.touch()
     kill = Mock()
-    launch_app = Mock()
-    if failure in ("app launch failed", "restore failed"):
-        rollback_failure = OSError("rollback denied") if failure == "restore failed" else None
-        launch_app.side_effect = [OSError(failure), rollback_failure, None]
+    launch_app = Mock(side_effect=OSError(failure) if failure == "app launch failed" else None)
     processes = [Mock(pid=pid) for pid in (101, 102, 104)]
     for process in processes:
         process.poll.return_value = None
@@ -57,7 +54,8 @@ def test_managed_start_and_stop(tmp_path, monkeypatch, failure):
     monkeypatch.setattr(launcher, "_launch_app", launch_app)
     monkeypatch.setattr(launcher, "is_port_listening", lambda _: False)
     monkeypatch.setattr(launcher, "is_pid_alive", lambda _: True)
-    monkeypatch.setattr(launcher, "_stop_app", Mock())
+    stop_app = Mock()
+    monkeypatch.setattr(launcher, "_stop_app", stop_app)
     apps = [launcher.windows.AppProcess(103, 1, exe)]
     monkeypatch.setattr(launcher.windows, "copilot_processes", lambda: apps)
     monkeypatch.setattr(launcher.windows, "ca_thumbprint", lambda _: "A" * 40)
@@ -81,14 +79,12 @@ def test_managed_start_and_stop(tmp_path, monkeypatch, failure):
         if failure == "not ready":
             trust.assert_not_called()
             launch_app.assert_not_called()
+            stop_app.assert_not_called()
         else:
             remove.assert_called_once_with("A" * 40)
-            assert launch_app.call_args_list == [call(exe, 20023), call(exe)]
-            if failure == "restore failed":
-                assert launcher.read_pids(local)["copilotPath"] == str(exe)
-                monkeypatch.setattr(launcher.windows, "process_commands", lambda _: {})
-                assert launcher.stop(tmp_path) == 0
-                assert launch_app.call_count == 3
+            launch_app.assert_called_once_with(exe, 20023)
+            # Closed before the proxied launch and again during rollback; never relaunched.
+            assert stop_app.call_args_list == [call(apps), call(apps)]
     else:
         assert launcher.start(tmp_path, 20024, 20023, mitmproxy_path=exe, copilot_path=exe) == 0
         state = launcher.read_pids(local)
@@ -100,7 +96,8 @@ def test_managed_start_and_stop(tmp_path, monkeypatch, failure):
         launch_app.assert_called_once_with(exe, 20023)
         assert launcher.stop(tmp_path) == 0
         remove.assert_called_once_with("A" * 40)
-        assert launch_app.call_args == call(exe)
+        launch_app.assert_called_once()  # stop closes Copilot App without relaunching it.
+        assert stop_app.call_args_list == [call(apps), call(apps)]
     gateway_args = workers.call_args_list[0].args[0]
     assert gateway_args[1:] == [
         "-m", "copilot_app_proxy.cli", "serve", "--port", "20024",
@@ -115,29 +112,37 @@ def test_managed_start_and_stop(tmp_path, monkeypatch, failure):
 
 
 @pytest.mark.usefixtures("simulated_platform")
-def test_stop_can_retry_failed_desktop_restore(tmp_path, monkeypatch):
+def test_stop_can_retry_when_copilot_app_does_not_close(tmp_path, monkeypatch):
     local = tmp_path / ".local"
     local.mkdir()
-    exe = tmp_path / "copilotapp.exe"
-    exe.touch()
     state_file = local / "pids.json"
-    state_file.write_text(
-        json.dumps({"gatewayPid": 101, "mitmPid": 102, "copilotPath": str(exe)}), encoding="ascii"
-    )
-    restore = Mock(side_effect=[OSError("could not restore"), None])
-    apps = [launcher.windows.AppProcess(103, 1, exe)]
+    state_file.write_text(json.dumps({"gatewayPid": 101, "mitmPid": 102}), encoding="ascii")
+    apps = [launcher.windows.AppProcess(103, 1, None)]
+    stop_app = Mock(side_effect=[RuntimeError("did not exit in time"), None])
     monkeypatch.setattr(launcher.windows, "process_commands", lambda _: {})
     monkeypatch.setattr(launcher.windows, "copilot_processes", lambda: apps)
     monkeypatch.setattr(launcher.windows, "remove_ca", Mock())
-    monkeypatch.setattr(launcher, "find_copilot_executable", lambda: None)
-    monkeypatch.setattr(launcher, "_stop_app", lambda _: apps.clear())
-    monkeypatch.setattr(launcher, "_launch_app", restore)
-    with pytest.raises(OSError, match="could not restore"):
+    monkeypatch.setattr(launcher, "_stop_app", stop_app)
+    with pytest.raises(RuntimeError, match="did not exit"):
         launcher.stop(tmp_path)
     assert state_file.exists()
     assert launcher.stop(tmp_path) == 0
-    assert restore.call_args_list == [call(exe), call(exe)]
+    assert stop_app.call_count == 2
     assert not state_file.exists()
+
+
+def test_stop_quickly_stops_keepalive_first_and_never_relaunches(tmp_path, monkeypatch):
+    (tmp_path / ".local").mkdir()
+    launcher.write_pids(tmp_path / ".local", gatewayPid=101, mitmPid=102, keepalivePid=104)
+    order: list[object] = []
+    monkeypatch.setattr(launcher, "_kill_tree", order.append)
+    monkeypatch.setattr(launcher.windows, "copilot_processes", lambda: ["app"])
+    monkeypatch.setattr(launcher, "_stop_app", lambda apps, timeout: order.append(apps))
+    launch_app = Mock()
+    monkeypatch.setattr(launcher, "_launch_app", launch_app)
+    launcher._stop_quickly(tmp_path)
+    assert order == [104, ["app"], 101, 102]
+    launch_app.assert_not_called()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows desktop lifecycle lock")
