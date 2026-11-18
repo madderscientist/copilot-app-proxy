@@ -16,10 +16,9 @@ API 调查过程和已验证的适用范围见 [API-DISCOVERY.md](API-DISCOVERY.
 ## 环境要求
 
 - Windows 10/11，使用本人账号的 PowerShell 5.1 或更高版本。
-- [Node.js](https://nodejs.org/) 22 或更高版本，安装时加入 PATH。
 - [Python](https://www.python.org/downloads/windows/) 3.12 或更高版本，可通过 `py` 或 `python` 启动。
 - 已安装、已登录并可正常使用 Code 功能的 Microsoft Copilot 桌面应用。GitHub Copilot 插件或网页版不能替代此桌面应用。
-- 能够访问 npm、PyPI 和账号实际使用的模型服务；企业网络可指定获准的包源。
+- 能够访问 PyPI 和账号实际使用的模型服务；企业网络可指定获准的包源。
 
 项目使用 Windows DPAPI，当前不支持 macOS 或 Linux。运行不需要管理员权限，但会在当前用户证书库中添加临时 CA，需要本人同意；若组织禁止 HTTPS 解密或脚本执行，不应绕过该策略。
 
@@ -33,7 +32,7 @@ Set-Location copilot-app-proxy
 .\install.ps1
 ```
 
-安装脚本创建项目内的 `.venv/`，从 `requirements.txt` 安装固定版本 mitmproxy，并用 `npm ci` 安装锁定的 Node.js 依赖。它不修改全局 Python/npm 配置，不安装证书、不启动代理或重启 Copilot。
+安装脚本创建项目内的 `.venv/`，从 `requirements.txt` 安装固定版本 mitmproxy、aiohttp 和 msal，并可编辑安装 `copilot-app-proxy`。它不修改全局 Python 配置，不安装证书、不启动代理或重启 Copilot。
 
 如果自动检测不到 Python，可指定真实解释器，不能使用 Windows 商店的空占位入口：
 
@@ -41,7 +40,7 @@ Set-Location copilot-app-proxy
 .\install.ps1 -PythonExecutable 'D:\Python\python.exe'
 ```
 
-默认直接运行 `.\install.ps1`，不需要填写包源。只有组织要求使用专用镜像时，才需要传入 `-PythonIndexUrl`（真实的 pip simple index 地址）或 `-NpmRegistry`（真实的 npm registry 地址）。地址应由组织提供，未指定时沿用本机 pip/npm 配置，脚本不会持久化这些地址。文档中的 `.example` 域名仅可用于说明，不能作为实际下载地址。
+默认直接运行 `.\install.ps1`，不需要填写包源。只有组织要求使用专用镜像时，才需要传入 `-PythonIndexUrl`（真实的 pip simple index 地址）。地址应由组织提供，未指定时沿用本机 pip 配置，脚本不会持久化这些地址。文档中的 `.example` 域名仅可用于说明，不能作为实际下载地址。
 
 不要在命令行或配置文件中写入带密码、令牌的包源地址，请使用组织批准的凭据管理方式。
 
@@ -77,6 +76,27 @@ Set-Location copilot-app-proxy
 
 停止后会保留 DPAPI 加密的网关密钥和上游令牌缓存，以便下次启动使用。若不再需要上游令牌缓存，可在停止后删除 `.local/token.dpapi`。
 
+### 状态检查与一键诊断
+
+随时查看代理、临时 CA 和上游令牌是否就绪：
+
+```powershell
+.\status.ps1
+```
+
+遇到端口冲突、路径未找到或启动异常时运行自检：
+
+```powershell
+.\doctor.ps1
+```
+
+也可直接调用 Python CLI：
+
+```powershell
+.\.venv\Scripts\python.exe -m copilot_app_proxy vscode-config
+.\.venv\Scripts\python.exe -m copilot_app_proxy key
+```
+
 ## 更新与卸载
 
 更新前先停止代理，避免替换正在使用的依赖：
@@ -94,7 +114,7 @@ git pull --ff-only
 
 | 现象 | 处理方式 |
 | --- | --- |
-| 未找到 Python 或 Node.js | 安装上述版本并重新打开终端，或通过 `-PythonExecutable` 指定 Python |
+| 未找到 Python | 安装 Python 3.12+ 并重新打开终端，或通过 `-PythonExecutable` 指定 Python |
 | 未找到 mitmdump.exe | 先运行 `install.ps1`，默认位置为 `.venv/Scripts/mitmdump.exe` |
 | Copilot 不在标准目录 | 先打开 Copilot 再启动代理，或使用 `-CopilotPath` |
 | 首次启动等待证书确认 | 在本人 Windows 会话中确认临时证书提示；不要使用管理员提升或关闭证书校验替代 |
@@ -165,7 +185,7 @@ Invoke-RestMethod http://127.0.0.1:19324/healthz
 ### 调用方提供令牌
 
 ```powershell
-node server.mjs
+.\.venv\Scripts\python.exe -m copilot_app_proxy
 ```
 
 每次请求使用 `Authorization: Bearer <上游访问令牌>` 或 `x-api-key: <上游访问令牌>`，二者只能选一个。此模式不会获取或刷新令牌；Azure 管理 API 令牌、GitHub 令牌或任意本机密钥不能替代目标资源令牌。
@@ -176,7 +196,7 @@ node server.mjs
 $env:ENTRA_CLIENT_ID = '自己的公共客户端 ID'
 $env:ENTRA_TENANT_ID = '组织租户 ID'
 $env:LOCAL_GATEWAY_KEY = [Guid]::NewGuid().ToString('N')
-npm run start:login
+.\.venv\Scripts\python.exe -m copilot_app_proxy --login
 ```
 
 该模式使用官方 MSAL，在微软浏览器窗口完成登录并在进程内静默刷新，重启后需要重新登录。它要求自己的有效单租户公共客户端注册、`http://localhost` 回调地址，以及 Microsoft FX Gateway 的 `LLM.Read` 委托权限。最小权限清单位于 `entra-permissions.json`。
@@ -188,8 +208,8 @@ npm run start:login
 在已安装依赖的项目目录中运行：
 
 ```powershell
-npm test
-.\.venv\Scripts\python.exe -m unittest test_relay_addon.py
+.\.venv\Scripts\python.exe -m pytest -v
+.\.venv\Scripts\python.exe -m ruff check src tests relay_addon.py
 ```
 
 测试只使用模拟请求和临时测试缓存，不需要真实账号、令牌或模型额度。
@@ -199,25 +219,29 @@ npm test
 ```text
 copilot-app-proxy/
   README.md                       中文使用说明
-  package.json                    Node.js 脚本和依赖
-  package-lock.json               锁定依赖
-  requirements.txt                固定版本的 Python 依赖
+  pyproject.toml                  Python 项目配置、依赖与 CLI 入口
+  requirements.txt                Python 运行时依赖
   install.ps1                     项目内依赖安装入口
-  server.mjs                      网关、流式转发和中继缓存
-  server.test.mjs                 自动化测试
-  relay_addon.py                  Copilot 请求令牌中继插件
-  test_relay_addon.py             中继失败重试测试
-  dpapi.mjs                       Windows DPAPI 加密读写
-  auth.mjs                        可选的 MSAL 独立登录
-  entra-permissions.json          可选登录的最小权限清单
   start-transparent-proxy.ps1     启动中继并配置 Copilot
   stop-transparent-proxy.ps1      停止中继并恢复 Copilot
-  .local/                        本机加密状态与临时证书，禁止提交
-  .venv/                         项目 Python 环境，禁止提交
-  node_modules/                  本机安装的依赖，禁止提交
+  status.ps1                      一键查看代理与令牌状态
+  doctor.ps1                      一键诊断环境与端口问题
+  relay_addon.py                  mitmproxy 脚本入口（转发至包内插件）
+  entra-permissions.json          可选登录的最小权限清单
+  src/copilot_app_proxy/
+    __main__.py                   CLI 入口（serve / status / doctor / key / vscode-config）
+    gateway.py                    aiohttp 网关、SSE 流式转发与路由
+    relay_store.py                内存与 DPAPI 令牌缓存及到期判断
+    relay_addon.py                Copilot 请求令牌中继插件
+    dpapi.py                      Windows DPAPI 原生加解密（crypt32.dll）
+    auth.py                       可选的 MSAL 独立登录
+    cli_tools.py                  状态检查、环境诊断、密钥与 VS Code 配置生成
+  tests/                          自动化测试套件
+  .local/                         本机加密状态、日志与临时证书，禁止提交
+  .venv/                          项目 Python 环境，禁止提交
 ```
 
-源码中不包含本机运行状态。请勿分享 `.local/`、`.venv/`、`node_modules/`、环境变量文件、证书私钥、DPAPI 缓存或日志；`.gitignore` 已排除这些内容。
+源码中不包含本机运行状态。请勿分享 `.local/`、`.venv/`、环境变量文件、证书私钥、DPAPI 缓存或日志；`.gitignore` 已排除这些内容。
 
 ## 整体架构
 
@@ -231,12 +255,12 @@ flowchart LR
 
   subgraph Local["本机代理"]
     Relay["mitmproxy · 127.0.0.1:19323<br/>relay_addon.py"]
-    subgraph Node["Node.js 网关 · 127.0.0.1:19324 · server.mjs"]
+    subgraph Gateway["Python aiohttp 网关 · 127.0.0.1:19324 · gateway.py"]
       Ingest["POST /_internal/token<br/>内部接收密钥"]
       API["/v1/messages · /v1/models<br/>本机网关密钥"]
       Store["RelayTokenStore<br/>内存令牌与到期判断"]
     end
-    DPAPI["dpapi.mjs<br/>Windows CurrentUser 加解密"]
+    DPAPI["dpapi.py<br/>Windows CurrentUser 加解密"]
     Cache[(".local/token.dpapi")]
   end
 
@@ -255,11 +279,11 @@ flowchart LR
 
 ### 请求与令牌流程
 
-1. **启动**：启动脚本加载或生成 DPAPI 加密的本机网关密钥，生成仅本次运行使用的内部接收密钥，启动 Node.js 和 mitmproxy。临时 CA 只加入当前用户证书库，代理配置只传给新启动的 Copilot App 进程。
+1. **启动**：启动脚本加载或生成 DPAPI 加密的本机网关密钥，生成仅本次运行使用的内部接收密钥，启动 Python 网关和 mitmproxy。临时 CA 只加入当前用户证书库，代理配置只传给新启动的 Copilot App 进程。
 2. **令牌更新**：Copilot App 正常请求模型 API 时，插件只提取目标域名及路径下的 Bearer 令牌，推送给 `/_internal/token`。网关更新内存及 DPAPI 缓存后返回成功，插件才标记该令牌已送达。
 3. **失败重试**：内部推送最多等待 3 秒。失败时不标记已送达，下次匹配的 Copilot 请求会重试同一令牌；没有额外轮询或后台刷新任务。
 4. **独立推理**：VS Code 使用本机网关密钥提交请求，网关取出当前令牌，补齐 API 版本、会话及客户端头，再向固定上游发起独立请求。请求体及工具定义不做协议转换。
-5. **流式返回**：网关用 Node.js `pipeline` 转发上游响应，保留 SSE 数据和背压；客户端断开时关闭对应上游请求。mitmproxy 的响应也采用流式转发。
+5. **流式返回**：网关用 Python `aiohttp` 流式转发上游响应，保留 SSE 数据和背压；客户端断开时关闭对应上游请求。mitmproxy 的响应也采用流式转发。
 6. **过期与停止**：网关读取 JWT 的 `exp` 进行本地到期判断，真正的验签和授权由上游负责。令牌缺失或过期时返回 `401`，提示在 Copilot App 中触发更新。停止脚本关闭代理、删除临时 CA 并恢复 Copilot App，保留 DPAPI 缓存。
 
 ### 模块职责
@@ -267,10 +291,12 @@ flowchart LR
 | 模块 | 职责 |
 | --- | --- |
 | `start-transparent-proxy.ps1` / `stop-transparent-proxy.ps1` | 进程、端口、临时证书和 Copilot 代理配置的生命周期 |
+| `status.ps1` / `doctor.ps1` | 一键状态查看与环境/端口/证书自检 |
 | `relay_addon.py` | 定向提取访问令牌、向内部接口推送、成功后去重；不解析 JWT、不管理刷新 |
-| `server.mjs` | 本机认证、接口路由、令牌缓存、请求头组装和 JSON/SSE 转发 |
-| `dpapi.mjs` | 用当前 Windows 用户身份加解密本机缓存 |
-| `auth.mjs` | 仅在可选 `--login` 模式下使用官方 MSAL，不参与透明中继 |
+| `gateway.py` / `relay_store.py` | 本机认证、接口路由、令牌缓存、请求头组装和 JSON/SSE 转发 |
+| `dpapi.py` | 用当前 Windows 用户身份（`crypt32.dll`）加解密本机缓存 |
+| `auth.py` | 仅在可选 `--login` 模式下使用官方 MSAL，不参与透明中继 |
+| `cli_tools.py` | 状态检查、环境诊断、密钥与 VS Code 配置生成 |
 
 三种模式最终都复用同一请求转发逻辑，仅令牌来源不同：`--relay` 从中继缓存读取，`--login` 从 MSAL 取得，默认模式使用调用方提供的上游令牌。
 

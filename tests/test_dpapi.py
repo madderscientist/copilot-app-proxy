@@ -29,6 +29,10 @@ def test_dpapi_roundtrip_and_file_persistence(tmp_path):
     assert secret not in raw
     assert load_protected_text(dpapi_file) == secret
 
+    # Tolerate UTF-8 BOM written by PowerShell [IO.File]::WriteAllText(..., UTF8)
+    dpapi_file.write_bytes(b"\xef\xbb\xbf" + raw.encode("utf-8"))
+    assert load_protected_text(dpapi_file) == secret
+
 
 @pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
 def test_dpapi_compatible_with_powershell_protected_data(tmp_path):

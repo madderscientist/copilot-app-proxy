@@ -36,7 +36,13 @@ $appIds = @($copilotApps.ProcessId)
 $roots = @($copilotApps | Where-Object ParentProcessId -notin $appIds)
 $copilotExe = ($roots | Select-Object -First 1).ExecutablePath
 if (-not $copilotExe) {
-    $copilotExe = Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Copilot\Application\copilotapp.exe'
+    $copilotCandidates = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Copilot\Application\copilotapp.exe'),
+        (Join-Path $env:ProgramFiles 'Microsoft\Copilot\Application\copilotapp.exe'),
+        (Join-Path $env:LocalAppData 'Microsoft\Copilot\Application\copilotapp.exe'),
+        (Join-Path $env:LocalAppData 'Programs\Microsoft Copilot\copilotapp.exe')
+    )
+    $copilotExe = $copilotCandidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
 }
 foreach ($root in $roots) {
     & taskkill.exe /PID $root.ProcessId /T /F | Out-Null
@@ -46,11 +52,15 @@ while ((Get-Process copilotapp -ErrorAction SilentlyContinue) -and (Get-Date) -l
     Start-Sleep -Milliseconds 250
 }
 
-$cpPsi = New-Object System.Diagnostics.ProcessStartInfo
-$cpPsi.FileName = $copilotExe
-$cpPsi.UseShellExecute = $false
-foreach ($proxyName in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
-    $cpPsi.EnvironmentVariables.Remove($proxyName)
+if ($copilotExe -and (Test-Path -LiteralPath $copilotExe)) {
+    $cpPsi = New-Object System.Diagnostics.ProcessStartInfo
+    $cpPsi.FileName = $copilotExe
+    $cpPsi.UseShellExecute = $false
+    foreach ($proxyName in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
+        $cpPsi.EnvironmentVariables.Remove($proxyName)
+    }
+    $null = [Diagnostics.Process]::Start($cpPsi)
+    Write-Host 'Transparent proxy stopped, temporary CA removed, and Copilot App restored.' -ForegroundColor Green
+} else {
+    Write-Host 'Transparent proxy stopped and temporary CA removed.' -ForegroundColor Green
 }
-$null = [Diagnostics.Process]::Start($cpPsi)
-Write-Host 'Transparent proxy stopped, temporary CA removed, and Copilot App restored.' -ForegroundColor Green

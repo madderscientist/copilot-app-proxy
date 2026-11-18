@@ -146,6 +146,6 @@ def save_protected_text(file_path: str | Path, plain_text: str) -> None:
 
 
 def load_protected_text(file_path: str | Path) -> str:
-    """Read and decrypt DPAPI-protected base64 text from disk."""
-    encoded = Path(file_path).read_text(encoding="utf-8")
+    """Read and decrypt DPAPI-protected base64 text from disk (tolerates UTF-8 BOM)."""
+    encoded = Path(file_path).read_text(encoding="utf-8-sig")
     return unprotect_text(encoded)
