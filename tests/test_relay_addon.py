@@ -1,3 +1,7 @@
+"""Tests for token relay mitmproxy addon."""
+
+from __future__ import annotations
+
 import io
 import os
 import unittest
@@ -8,11 +12,11 @@ from unittest.mock import MagicMock, Mock, patch
 
 from mitmproxy import http
 
-from relay_addon import TokenRelayAddon
+from copilot_app_proxy.relay_addon import TokenRelayAddon
 
 
 class TokenRelayTests(unittest.TestCase):
-    def test_failed_push_retries_and_success_is_deduplicated(self):
+    def test_failed_push_retries_and_success_is_deduplicated(self) -> None:
         token = "synthetic-test-token-not-a-real-credential"
         with patch.dict(os.environ, {"RELAY_INGEST_SECRET": "synthetic-secret"}):
             addon = TokenRelayAddon()
@@ -20,10 +24,13 @@ class TokenRelayTests(unittest.TestCase):
         response.__enter__.return_value.status = 200
         addon.opener = Mock()
         addon.opener.open.side_effect = [urllib.error.URLError("temporary outage"), response]
-        flow = SimpleNamespace(request=http.Request.make(
-            "POST", "https://loki.delve.office.com/api/v1/llmapi/v1/messages",
-            headers={"authorization": f"Bearer {token}"},
-        ))
+        flow = SimpleNamespace(
+            request=http.Request.make(
+                "POST",
+                "https://loki.delve.office.com/api/v1/llmapi/v1/messages",
+                headers={"authorization": f"Bearer {token}"},
+            )
+        )
         with redirect_stdout(io.StringIO()) as output:
             addon.request(flow)
             self.assertEqual(addon.last_token, "")

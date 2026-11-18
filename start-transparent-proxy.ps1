@@ -50,9 +50,14 @@ if ($CopyKey) {
 
 $relaySecret = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
 
+$venvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $venvPython)) {
+    throw 'Python environment .venv\Scripts\python.exe was not found. Run .\install.ps1 first.'
+}
+
 $gwPsi = New-Object System.Diagnostics.ProcessStartInfo
-$gwPsi.FileName = (Get-Command node).Source
-$gwPsi.Arguments = 'server.mjs --relay'
+$gwPsi.FileName = $venvPython
+$gwPsi.Arguments = "-m copilot_app_proxy --relay --port $GatewayPort"
 $gwPsi.WorkingDirectory = $repoRoot
 $gwPsi.UseShellExecute = $false
 $gwPsi.CreateNoWindow = $true

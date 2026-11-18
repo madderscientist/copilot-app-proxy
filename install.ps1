@@ -1,16 +1,10 @@
 param(
     [string]$PythonExecutable,
-    [string]$PythonIndexUrl,
-    [string]$NpmRegistry
+    [string]$PythonIndexUrl
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
-$node = (Get-Command node.exe -ErrorAction Stop).Source
-$nodeVersion = (& $node --version).TrimStart('v')
-if (([version]$nodeVersion).Major -lt 22) {
-    throw 'Node.js 22 or later is required.'
-}
 
 $python = $null
 $candidates = if ($PythonExecutable) { @($PythonExecutable) } else { @('py.exe', 'python.exe', 'python3.exe') }
@@ -44,15 +38,10 @@ if ($PythonIndexUrl) { $pipArguments += @('--index-url', $PythonIndexUrl) }
 & $venvPython @pipArguments
 if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python dependencies.' }
 
-Push-Location $repoRoot
-try {
-    $npmArguments = @('ci', '--ignore-scripts', '--no-audit', '--no-fund')
-    if ($NpmRegistry) { $npmArguments += @('--registry', $NpmRegistry) }
-    & npm.cmd @npmArguments
-    if ($LASTEXITCODE -ne 0) { throw 'Could not install the Node.js dependencies.' }
-} finally {
-    Pop-Location
-}
+$editableArgs = @('-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'off', '--no-deps', '-e', $repoRoot)
+if ($PythonIndexUrl) { $editableArgs += @('--index-url', $PythonIndexUrl) }
+& $venvPython @editableArgs
+if ($LASTEXITCODE -ne 0) { throw 'Could not install copilot-app-proxy package.' }
 
 Write-Host 'Installation complete. No certificates, proxy settings, or accounts were changed.' -ForegroundColor Green
 Write-Host 'Start with: .\start-transparent-proxy.ps1 -CopyKey'
