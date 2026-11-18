@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -52,6 +54,10 @@ RESPONSE_HEADERS = (
 )
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+Logger = Callable[[str], None]
+
+# Per-request facts recorded for the optional access log. Never holds bodies or credentials.
+_access_info: ContextVar[dict[str, Any] | None] = ContextVar("access_info", default=None)
 
 
 class RequestError(Exception):
@@ -232,6 +238,8 @@ async def _forward(
                 for value in upstream_resp.headers.getall(name, ()):
                     stream_resp.headers.add(name, value)
             await stream_resp.prepare(request)
+            if (info := _access_info.get()) is not None:
+                info["headersAt"] = time.monotonic()
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
                     await stream_resp.write(chunk)
@@ -244,6 +252,42 @@ async def _forward(
         if isinstance(exc, TimeoutError):
             raise RequestError(504, "api_error", "Upstream timed out.") from exc
         raise RequestError(502, "api_error", "Upstream connection failed.") from exc
+
+
+def _access_log_middleware(log: Logger) -> Any:
+    """Log one line per API request."""
+
+    @web.middleware
+    async def middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+        if request.path in ("/healthz", "/_internal/token"):
+            return await handler(request)
+        info: dict[str, Any] = {}
+        _access_info.set(info)
+        started = time.monotonic()
+        status: int | str = "aborted"
+        try:
+            response = await handler(request)
+            status = response.status
+            return response
+        finally:
+            log(_access_line(request, info, status, started))
+
+    return middleware
+
+
+def _access_line(
+    request: web.Request, info: dict[str, Any], status: int | str, started: float
+) -> str:
+    parts = [f"{request.method} {request.path}"]
+    if model := info.get("model"):
+        parts.append(f"model={model}")
+    if "stream" in info:
+        parts.append(f"stream={str(info['stream']).lower()}")
+    parts.append(f"-> {status}")
+    if headers_at := info.get("headersAt"):
+        parts.append(f"headers={headers_at - started:.2f}s")
+    parts.append(f"total={time.monotonic() - started:.2f}s")
+    return " ".join(parts)
 
 
 async def _http_client(app: web.Application) -> AsyncGenerator[None, None]:
@@ -274,12 +318,14 @@ def create_app(
     upstream_base: str = DEFAULT_UPSTREAM,
     body_limit: int = DEFAULT_BODY_LIMIT,
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    log: Logger | None = None,
 ) -> web.Application:
     """Create the gateway app.
 
     Model routes need no caller credentials: any local program may call them, while the
     Host/Origin checks keep browser pages out. Only the relay addon may push tokens, using
-    the per-run ``relay_ingest_secret``.
+    the per-run ``relay_ingest_secret``. ``log`` receives one line per API request and per
+    token update; it never sees tokens or bodies.
     """
     if not isinstance(relay_ingest_secret, str) or len(relay_ingest_secret) < (
         MIN_INGEST_SECRET_LENGTH
@@ -310,7 +356,10 @@ def create_app(
         if not hmac.compare_digest(secret.encode("utf-8"), expected_secret):
             raise RequestError(401, "authentication_error", "Invalid relay ingest secret.")
         _, payload = await _read_json_body(request, INGEST_BODY_LIMIT, timeout_sec)
+        previous = relay_store.status()["tokenExpiresOn"]
         info = await relay_store.set_token(payload.get("token"))
+        if log is not None and info["expiresOn"] != previous:
+            log(f"Token updated: exp={info['expiresOn'] or 'unknown'}")
         return _json_response(200, {"status": "updated", "tokenExpiresOn": info["expiresOn"]})
 
     def model_route(method: str, upstream_path: str) -> Handler:
@@ -320,12 +369,19 @@ def create_app(
             token = relay_store.get_token()
             body = None
             if method == "POST":
-                body, _ = await _read_json_body(request, body_limit, timeout_sec)
+                body, parsed = await _read_json_body(request, body_limit, timeout_sec)
+                if (access := _access_info.get()) is not None:
+                    if isinstance(parsed.get("model"), str):
+                        access["model"] = parsed["model"][:100]
+                    access["stream"] = parsed.get("stream") is True
             return await _forward(request, target_url, token, body, timeout_sec)
 
         return forward
 
-    app = web.Application(client_max_size=0, middlewares=[_local_api_middleware])
+    middlewares = [_local_api_middleware]
+    if log is not None:
+        middlewares.insert(0, _access_log_middleware(log))
+    app = web.Application(client_max_size=0, middlewares=middlewares)
     app.cleanup_ctx.append(_http_client)
     app.router.add_route("GET", "/healthz", healthz)
     app.router.add_route("POST", "/_internal/token", ingest_token)

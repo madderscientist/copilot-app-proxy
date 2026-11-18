@@ -13,7 +13,10 @@ from typing import Any
 from copilot_app_proxy.dpapi import DpapiError, load_protected_text, save_protected_text
 
 TOKEN_PATTERN = re.compile(r"^[^\s,\x00-\x1f\x7f]{1,32768}$")
-CAPTURE_HINT = "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。"
+CAPTURE_HINT = (
+    "请运行 copilot-proxy refresh，或在 Copilot App 的 Code 页发送一次消息，"
+    "让中继获取当前模型 API 的访问令牌。"
+)
 
 
 class TokenError(Exception):

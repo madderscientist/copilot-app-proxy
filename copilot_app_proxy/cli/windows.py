@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -145,6 +146,48 @@ def trust_ca(cert: Path, thumbprint: str) -> None:
         subprocess.run(["certutil.exe", "-user", "-addstore", "Root", str(cert)], check=True)
         if not ca_is_trusted(thumbprint):
             raise RuntimeError("Temporary CA was not trusted in the current user's store.")
+
+
+_SELECT_CODE_TAB = r"""
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$ae = [Windows.Automation.AutomationElement]
+$tabCondition = New-Object Windows.Automation.AndCondition(
+    (New-Object Windows.Automation.PropertyCondition($ae::ControlTypeProperty,
+        [Windows.Automation.ControlType]::TabItem)),
+    (New-Object Windows.Automation.PropertyCondition($ae::NameProperty, 'Code')))
+$session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+$deadline = (Get-Date).AddSeconds(__TIMEOUT__)
+while ((Get-Date) -lt $deadline) {
+    foreach ($p in Get-Process copilotapp -ErrorAction SilentlyContinue) {
+        if ($p.SessionId -ne $session -or $p.MainWindowHandle -eq [IntPtr]::Zero) { continue }
+        try {
+            $tab = $ae::FromHandle($p.MainWindowHandle).FindFirst(
+                [Windows.Automation.TreeScope]::Descendants, $tabCondition)
+            if ($tab) {
+                $tab.GetCurrentPattern([Windows.Automation.SelectionItemPattern]::Pattern).Select()
+                'selected'; exit 0
+            }
+        } catch { }
+    }
+    Start-Sleep -Milliseconds 500
+}
+exit 1
+"""
+
+
+def select_code_tab(timeout: int = 60) -> bool:
+    """Select Copilot App's Code tab through UI Automation once its window is ready."""
+    script = _SELECT_CODE_TAB.replace("__TIMEOUT__", str(int(timeout)))
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        check=False,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout + 30,
+    )
+    return result.returncode == 0 and "selected" in result.stdout
 
 
 def remove_ca(thumbprint: str) -> None:

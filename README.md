@@ -1,30 +1,34 @@
 # Copilot App 本机代理
 
-将本机 Copilot App 的模型访问中继到本地模型 API（Claude 用 Messages，GPT 用 Responses），供 VS Code 等客户端使用。代理转发请求和 SSE 流，不运行 Copilot CLI 的 agent 或工具执行流程，工具定义、执行和确认仍由 VS Code 负责。
+把 Microsoft Copilot 桌面应用（下称 Copilot App）能用的模型，以本地 API 的形式提供给 VS Code、Codex CLI 等程序：Claude 系列走 Messages 协议，GPT 系列走 Responses 协议。代理只转发请求和流式响应；工具调用、确认和对话管理仍由调用方（如 VS Code）负责。
 
-仅限组织允许的本人账号会话复用。安装成功不等于获得模型权限；不同账号、组织、地区和 Copilot 版本的服务及模型可用性可能不同。本项目不是微软官方集成，也不提供账号、订阅或令牌。
+> 仅限组织允许的本人账号使用。本项目不是微软官方集成，不提供账号、订阅或令牌；能否使用取决于你的账号、组织和 Copilot 版本。API 的调查过程与已验证范围见 [API-DISCOVERY.md](API-DISCOVERY.md)。
 
-API 调查过程和已验证的适用范围见 [API-DISCOVERY.md](API-DISCOVERY.md)。
+## 工作原理
 
-## 当前状态
+```text
+Copilot App ──HTTPS──▶ 本机 mitmproxy ──▶ 模型 API
+                            │ 截取访问令牌
+                            ▼
+VS Code ──────────▶ 本机网关（附上令牌）──▶ 模型 API
+```
 
-- 网关默认监听 `http://127.0.0.1:19324`，本机程序调用无需密钥。
-- Copilot App 的 HTTPS 代理默认监听 `http://127.0.0.1:19323`。
-- 已实测通过本地网关获取模型列表，并调用 Claude 和 GPT 系列模型（含流式与工具调用）返回 `200`。
-- 自动化测试覆盖 Messages 与 Responses 转发、SSE、凭据隔离、错误处理和 DPAPI 缓存。VS Code 完整 agent 工作流仍需按实际配置验证。
+1. `start` 让 Copilot App 经本机代理联网。App 用你的账号正常请求模型 API 时，代理截取其中的访问令牌交给网关。
+2. VS Code 等程序向本机网关发请求，网关附上该令牌转发给模型 API，并原样返回（含 SSE 流）。
+3. 令牌约 1–1.5 小时过期。自动续期进程在快到期时重启 Copilot App 并打开 Code 页，让 App 自己取得新令牌。
 
-## 环境要求
+代理不读取 App 的登录缓存，也不自行刷新令牌；登录和续签始终由 Copilot App 完成。
 
-- Windows 10/11，使用本人账号的 PowerShell 5.1 或更高版本。
+## 快速开始
+
+### 1. 环境要求
+
+- Windows 10/11（依赖 DPAPI 和 UI 自动化，不支持 macOS/Linux），PowerShell 5.1 或更高版本；不需要管理员权限。
 - Python 3.12 或更高版本。
-- 已安装、已登录并可正常使用 Code 功能的 Microsoft Copilot 桌面应用。GitHub Copilot 插件或网页版不能替代此桌面应用。
-- 能够访问 PyPI 和账号实际使用的模型服务；企业网络可指定获准的包源。
+- 已安装、已登录、能正常使用 Code 页的 Copilot App（GitHub Copilot 插件或网页版不能替代）。
+- 能访问 PyPI（或组织提供的包源）和模型服务。
 
-项目使用 Windows DPAPI，当前不支持 macOS 或 Linux。运行不需要管理员权限，但会在当前用户证书库中添加临时 CA，需要本人同意。
-
-## 首次安装
-
-克隆仓库，或下载并解压仓库源码，然后在项目目录中运行安装脚本：
+### 2. 安装
 
 ```powershell
 git clone https://github.com/madderscientist/copilot-app-proxy.git
@@ -32,97 +36,167 @@ Set-Location copilot-app-proxy
 .\install.ps1
 ```
 
-脚本自动查找 Python 3.12+，创建项目内的 `.venv/`，从 `pyproject.toml` 安装依赖，并以可编辑模式安装本项目。它不修改全局 Python 配置，不安装证书、不启动代理或重启 Copilot。
+脚本会找到 Python 3.12+，在项目内创建 `.venv/` 并安装依赖。它不会改动证书、代理设置或 Copilot。
 
-- 自动检测不到 Python 时，指定真实解释器（不能用 Windows 商店的空占位入口）：`.\install.ps1 -PythonExecutable 'D:\Python\python.exe'`。
-- 组织要求使用专用镜像时，传入 `-PythonIndexUrl <pip simple index 地址>`；未指定时沿用本机 pip 配置，地址不会被持久化。不要在命令行或配置文件中写入带密码、令牌的包源地址。
-- 若 PowerShell 禁止运行脚本，可直接用 Python 执行同一安装：`py -3 -m copilot_app_proxy.cli install`（镜像参数为 `--index-url`）。
+- 找不到 Python 时指定完整路径（不能用 Windows 应用商店的占位入口）：`.\install.ps1 -PythonExecutable 'D:\Python\python.exe'`。
+- 使用组织镜像：`.\install.ps1 -PythonIndexUrl <pip simple 地址>`。不要在地址中写入密码或令牌。
+- PowerShell 禁止运行脚本时：`py -3 -m copilot_app_proxy.cli install`（镜像参数为 `--index-url`）。
 
-安装完成后，所有操作都通过 `.\.venv\Scripts\copilot-proxy.exe` 完成，运行 `copilot-proxy --help` 可查看全部命令。
+之后的命令都通过 `.\.venv\Scripts\copilot-proxy.exe` 执行，下文简写为 `copilot-proxy`；`copilot-proxy --help` 可列出全部命令。
 
-## 启动与停止
+### 3. 启动
+
+先结束 Copilot App 中正在进行的任务，然后运行：
 
 ```powershell
 .\.venv\Scripts\copilot-proxy.exe start
 ```
 
-`start` 会启动网关和 HTTPS 代理，在当前用户根证书库中信任本次代理 CA，随后重启 Copilot App 并为其进程配置代理，不修改系统代理。请先结束 Copilot 中正在执行的任务；如果 Windows 提示证书信任确认，需要本人确认。
+`start` 依次完成：
 
-启动后，在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。
+1. 启动网关（`127.0.0.1:19324`）和 HTTPS 代理（`127.0.0.1:19323`）。
+2. 把本次生成的临时 CA 加入**当前用户**的受信任根证书。Windows 可能弹出确认，需要你点确定。
+3. 重启 Copilot App，仅让这个 App 进程走代理；系统代理不变。
+4. 自动打开 App 的 Code 页，App 随即请求模型列表，网关拿到令牌（不消耗额度），终端显示 `Token: ready`。
+5. 启动自动续期，然后留在终端：上方滚动显示日志，空一行后是固定在底部的状态栏（窗口标题同步显示令牌剩余时间）：
 
-停止代理、移除临时根证书及其私钥目录，并恢复 Copilot App 的普通启动方式：
+```text
+15:42:10 [gateway] POST /v1/messages model=claude-opus-5.5 stream=true -> 200 headers=1.20s total=8.40s
+15:44:43 [keepalive] Token has 240s left; relaunching Copilot App (attempt 1).
+15:45:03 [gateway] Token updated: exp=2026-11-18T07:45:58Z
 
-```powershell
-.\.venv\Scripts\copilot-proxy.exe stop
+ Token 61 min left (expires 16:45, renews ~16:41)  keep-alive on | Ctrl+C to stop
 ```
 
-移除根证书时 Windows 会弹出删除确认，需要本人确认；若取消，`stop` 会报错并保留记录，可再次执行。
+日志每行依次为时间、来源（`gateway` 网关、`mitm` 代理、`keepalive` 自动续期）和内容。网关为每个 API 请求记一行：方法、路径、模型、是否流式、状态码、响应头和总耗时，不含令牌、提示词或回复。
 
-停止后会保留 DPAPI 加密的上游令牌缓存 `.local/token.dpapi`，以便下次启动使用；不再需要时可在停止后删除。
+终端里会用颜色区分：来源各有颜色；状态码 2xx/3xx 为绿色、4xx 为黄色、5xx 为红色；令牌更新为绿色，重试、沿用旧令牌等提示为黄色，错误为红色。状态栏第一块显示令牌状态，底色为绿色（正常）、黄色（即将续期）或红色（没有可用令牌或网关无响应）；后面是自动续期状态（停止时显示黄色的 `keep-alive STOPPED`）和停止提示，用 `|` 分隔。请求是否成功直接看上方日志里状态码的颜色。设置环境变量 `NO_COLOR` 可关闭颜色。
 
-同一项目的启停不能并行执行。若提示另一条启停命令正在运行，请等它结束再重试。若停止时 Copilot 未能恢复普通启动，先解决报错，再执行 `stop`；用于恢复的记录会保留到操作成功。
+按 **Ctrl+C** 停止：结束所有进程、移除临时 CA（Windows 会弹出删除确认），并让 Copilot App 恢复直连。
 
-### 端口与路径
+### 4. 接入 VS Code
 
-长期使用其他端口时，编辑项目根目录的 [config.json](./config.json)（`gateway_port` 和 `proxy_port`）。端口按以下顺序确定：
-
-1. 命令行参数 `--gateway-port` / `--proxy-port`；
-2. `status` 和 `vscode-config` 会优先使用正在运行的会话所记录的端口，运行中编辑配置不会造成不一致；
-3. `config.json`；
-4. 默认值 `19324` / `19323`。
-
-```powershell
-.\.venv\Scripts\copilot-proxy.exe start --gateway-port 19424 --proxy-port 19423
-```
-
-启动时优先从正在运行的 Copilot App 获取程序路径，否则使用标准安装位置。如果安装在其他目录，或希望使用自己安装的 mitmproxy，可显式指定：
-
-```powershell
-.\.venv\Scripts\copilot-proxy.exe start --copilot-path 'D:\Apps\Copilot\copilotapp.exe' --mitmproxy-path 'D:\Tools\mitmdump.exe'
-```
-
-### 状态检查与诊断
-
-```powershell
-.\.venv\Scripts\copilot-proxy.exe status   # 网关、代理、临时 CA 和上游令牌是否就绪
-.\.venv\Scripts\copilot-proxy.exe doctor   # 端口冲突、路径未找到或启动异常时自检
-```
-
-## 更新与卸载
-
-更新前先停止代理，避免替换正在使用的依赖：
-
-```powershell
-.\.venv\Scripts\copilot-proxy.exe stop
-git pull --ff-only
-.\install.ps1
-.\.venv\Scripts\copilot-proxy.exe start
-```
-
-卸载时先运行 `copilot-proxy stop`，确认临时证书已移除、Copilot 已恢复普通启动，再删除整个项目目录。不要在代理仍运行时直接删除 `.local/` 或项目目录。
-
-## 常见问题
-
-| 现象 | 处理方式 |
-| --- | --- |
-| 未找到 Python | 安装 Python 3.12+ 并重新打开终端，或使用 `.\install.ps1 -PythonExecutable <完整路径>` |
-| 未找到 mitmdump.exe | 先运行 `.\install.ps1`，默认位置为 `.venv/Scripts/mitmdump.exe` |
-| Copilot 不在标准目录 | 先打开 Copilot 再启动代理，或使用 `--copilot-path` |
-| 首次启动等待证书确认 | 在本人 Windows 会话中确认临时证书提示；不要使用管理员提升或关闭证书校验替代 |
-| 端口占用 | 先停止旧代理，或指定未占用且互不相同的网关和代理端口 |
-| 网关返回没有令牌或令牌已过期 | 在 Copilot 的 Code 页发一次消息，等应用取得新令牌；网关不会替应用登录 |
-| 代理连接后出现证书错误 | 不要跳过 HTTPS 证书验证；停止代理，确认当前用户证书与安装流程，必要时重新启动 |
-| 模型未开放、版本头或服务地址变化 | 该账号或应用版本可能不适用；参考调查记录，不能把本机缓存当作额外授权 |
-
-## 接入 VS Code
-
-在聊天的模型管理中选择 **Add Models → Custom Endpoint**。VS Code 的 Custom Endpoint 不会自行查询模型列表，需要在配置里逐个列出模型，每个模型单独指定 URL 和 API 类型。以下命令按当前端口生成配置：
+在 VS Code 聊天的模型管理中选择 **Add Models → Custom Endpoint**，填入以下命令输出的 JSON：
 
 ```powershell
 .\.venv\Scripts\copilot-proxy.exe vscode-config
 ```
 
-命令会通过网关读取 `GET /v1/models`，按上游的 `supported_endpoints` 选择接口：Claude 系列走 `/v1/messages`（`apiType: messages`），GPT 系列走 `/v1/responses`（`apiType: responses`），名称、上下文窗口和强度档位都取自上游。网关未启动或令牌已过期时，会在 stderr 给出提示，并输出内置的模型列表。默认端口下 Claude 和 GPT 模型的配置分别如下（同系列的其他模型只有 `id`、`name` 和强度档位可能不同）：
+模型配置的细节见[客户端配置](#客户端配置)。
+
+## 日常使用
+
+### 命令一览
+
+| 命令 | 作用 |
+| --- | --- |
+| `start` | 启动代理并留在终端显示日志，Ctrl+C 停止 |
+| `stop` | 停止代理、移除临时 CA、恢复 Copilot App；也用于清理异常退出后的残留 |
+| `status` | 查看网关、代理、自动续期、临时 CA 和令牌的状态 |
+| `refresh` | 立即重启 Copilot App 并打开 Code 页，尝试取得新令牌 |
+| `vscode-config` | 生成 VS Code 的 Custom Endpoint 配置 |
+| `doctor` | 检查 Python、mitmdump、Copilot App 路径和端口占用 |
+| `keepalive` | 在当前终端运行自动续期；仅在以 `--no-keepalive` 启动后需要 |
+
+### `start` 的选项
+
+| 选项 | 作用 |
+| --- | --- |
+| `--detach` | 启动完成后立即返回，代理在后台运行，之后用 `stop` 停止 |
+| `--no-keepalive` | 不启动自动续期 |
+| `--observe` | 调查用：把 Copilot App 发往模型服务的请求元数据写入 `.local/logs/observe.jsonl`（不显示在终端），见[日志](#日志) |
+| `--gateway-port` / `--proxy-port` | 临时改用其他端口，见[端口与路径](#端口与路径) |
+| `--copilot-path` / `--mitmproxy-path` | 指定 `copilotapp.exe` 或 `mitmdump.exe` 的位置 |
+
+网关、代理和自动续期都是独立的后台进程，前台的 `start` 只负责显示它们的日志和在退出时清理。因此 `--detach` 与默认方式功能相同，区别只是终端不会留下来。
+
+### 令牌续期
+
+自动续期默认开启。它每分钟查看一次令牌剩余时间，不足 240 秒时重启 Copilot App 并打开 Code 页。
+
+- **为什么要等快到期**：App 会一直复用缓存中的令牌，只在剩余约 5 分钟以内才换新（实测，见 API-DISCOVERY 第九节）。过早重启只会拿回旧令牌。
+- **只等着会续期吗**：本次闲置到过期的实验未观察到 App 发出新令牌请求，网关最终返回 `401`，因此目前不能依赖闲置自动续期。
+- **失败怎么办**：没拿到新令牌时每 60 秒重试，连续 5 次失败后停止续期，网关届时返回 `401`。可手动运行 `refresh`，或在 Code 页发一条消息。
+- **代价**：每次续期都会重启 Copilot App，App 里正在进行的任务会中断；VS Code 的对话不受影响。
+- **限制**：锁屏、休眠或 App 需要重新登录时无法续期。
+- **不会残留**：续期进程连续约 30 秒连不上网关就自行退出，不会在代理停止后继续重启 App。
+
+`refresh` 在令牌还有较长有效期时会显示 `reused cached token` 并返回 1，这是正常现象。
+
+### 停止与异常退出
+
+```powershell
+.\.venv\Scripts\copilot-proxy.exe stop
+```
+
+在前台按 Ctrl+C 等同于 `stop`。移除临时 CA 时 Windows 会弹出确认；若取消，`stop` 会报错并保留记录，可再次执行。停止后会保留加密的令牌缓存 `.local/token.dpapi`，供下次启动使用。
+
+| 情况 | 结果与处理 |
+| --- | --- |
+| 直接关闭终端窗口 | 程序会结束后台进程，并让 Copilot App 恢复直连；但来不及移除临时 CA。之后 `status` 会提示运行 `stop` |
+| 注销或关机 | 进程都会结束，下次登录 App 正常直连；临时 CA 仍在，运行 `stop` 清理 |
+| 后台进程被强行结束 | Copilot App 会因连不上代理而断网。运行 `stop`，或完全退出 Copilot App 后重新打开 |
+
+临时 CA 留在受信任列表里不影响使用，但其私钥（`.local/mitm-ca/`）一旦泄露，就可能被用来伪造网站证书，所以应及时用 `stop` 清理。
+
+同一项目的启动和停止不能同时进行；提示“Another start or stop is in progress”时，稍后重试即可。
+
+### 状态检查
+
+```powershell
+.\.venv\Scripts\copilot-proxy.exe status   # 各进程、临时 CA 和令牌是否就绪
+.\.venv\Scripts\copilot-proxy.exe doctor   # 启动失败时检查环境与端口
+```
+
+### 日志
+
+各进程的日志写入 `.local/logs/`：`gateway.log`、`mitm.log`、`keepalive.log`，以及记录异常输出的对应 `.err.log`。每次 `start` 会清空它们；`gateway.log` 在运行中超过 5 MB 时转存为 `gateway.log.1`（只保留这一个备份），因此长期运行也不超过约 10 MB。使用 `--detach` 时在这里查看。
+
+日志文件本身不含颜色代码。终端被重定向（例如输出到文件）时不显示状态栏和颜色，只输出纯文本日志。
+
+`--observe` 写入的 `observe.jsonl` 每行记录 Copilot App 的一个请求：时间、方法、路径（去掉查询参数）、状态码、令牌 SHA-256 的前 12 位，以及 JWT 的 `iat`/`nbf`/`exp`。不包含令牌本身、其他声明或请求内容。主要用于研究 App 何时换新令牌。实时查看：
+
+```powershell
+Get-Content .local\logs\observe.jsonl -Wait -Tail 0
+```
+
+### 端口与路径
+
+长期改用其他端口时，编辑项目根目录的 [config.json](./config.json)（`gateway_port`、`proxy_port`）。端口的优先级为：命令行参数 > 正在运行的代理所记录的端口（仅 `status`、`vscode-config` 等查询命令）> `config.json` > 默认值 `19324` / `19323`。
+
+`start` 优先使用正在运行的 Copilot App 的程序路径，否则查找标准安装位置；都找不到时用 `--copilot-path` 指定。
+
+### 更新与卸载
+
+```powershell
+.\.venv\Scripts\copilot-proxy.exe stop
+git pull --ff-only
+.\install.ps1
+```
+
+卸载时先运行 `stop`，确认临时 CA 已移除、Copilot App 已恢复直连，再删除整个项目目录。
+
+## 常见问题
+
+| 现象 | 处理方式 |
+| --- | --- |
+| 找不到 Python | 安装 Python 3.12+ 后重新打开终端，或用 `.\install.ps1 -PythonExecutable <完整路径>` |
+| 找不到 mitmdump.exe | 先运行 `.\install.ps1` |
+| 找不到 Copilot App | 先打开 Copilot App 再启动，或用 `--copilot-path` |
+| 端口被占用 | 停止旧代理，或换用未占用的端口（两个端口不能相同） |
+| 未自动打开 Code 页 | 手动点开 Code 页即可取得令牌 |
+| 网关返回 `401`（没有令牌或已过期） | 运行 `refresh`，或在 Code 页发一条消息 |
+| Copilot App 无法联网 | 运行 `stop`；或完全退出 App 后重新打开 |
+| 出现证书错误 | 不要跳过证书校验；运行 `stop` 后重新 `start` |
+| 模型不可用、版本头或服务地址变化 | 账号或 App 版本可能不适用，参考 API-DISCOVERY |
+
+## 客户端配置
+
+### VS Code
+
+VS Code 的 Custom Endpoint 不会自己查询模型列表，需要逐个列出模型。`vscode-config` 通过网关读取模型列表，按 `supported_endpoints` 分配接口：Claude 系列用 `/v1/messages`（`apiType: messages`），GPT 系列用 `/v1/responses`（`apiType: responses`）；名称、上下文窗口和思考强度都取自上游。网关未运行或令牌已过期时，会提示并输出内置的模型列表。
+
+默认端口下的输出示例（每个系列只列一个模型）：
 
 ```json
 [
@@ -160,47 +234,18 @@ git pull --ff-only
 ]
 ```
 
-### 思考强度与上限
+`apiKey` 可以填任意非空值，网关不校验，也不会转发。
 
-- 思考强度在 VS Code 模型选择器的 **Effort Level** 中切换。各模型支持的档位来自 `GET /v1/models` 的 `capabilities.supports.reasoning_effort`，传入不支持的档位会返回 400。
-- **Claude**：请求以 `output_config.effort` 发送，可选 `low`、`medium`、`high`、`xhigh`、`max`，直接调用时在请求体中加入 `"output_config": {"effort": "high"}`。上游只接受 `"thinking": {"type": "adaptive"}`；`enabled` 加 `budget_tokens` 和 `disabled` 都会返回 400。不传 `thinking` 时模型同样会自适应思考。
-- **GPT**：请求以 `"reasoning": {"effort": "high"}` 发送，多数模型额外支持 `none`（`gpt-61-sol` 不支持）。
-- 上下文窗口来自 `capabilities.limits.max_context_window_tokens`：Claude 为 1000000，GPT 为 1050000。模型列表不返回最大输出：Claude 的 `max_tokens` 超过 128000 会被拒绝；GPT 的 `max_output_tokens` 上游不校验，配置中同样填 128000，并非已验证的上限。
+**思考强度与上限**
 
-## 令牌与安全边界
-
-- 中继插件只提取发往 `loki.delve.office.com/api/v1/llmapi/` 的 Bearer 访问令牌，不收集 Cookie 或刷新令牌。
-- 令牌更新依赖 Copilot App 自己的登录和刷新流程。过期后，在 Code 页触发请求，应用取得新令牌后，中继才会更新缓存；代理不会自行冒用应用刷新令牌。
-- 上游令牌使用 Windows DPAPI 的 `CurrentUser` 范围加密保存在 `.local/token.dpapi`，不能当作可跨用户、跨机器迁移的凭据。
-- 临时 CA 私钥位于 `.local/mitm-ca/`，不可分享；`stop` 会清理该目录及证书信任项。
-- 网关与代理只绑定 `127.0.0.1`。模型接口不需要密钥，但拒绝带浏览器 `Origin` 头、非本机 `Host` 或 URL 查询参数的请求，网页无法借用本机网关。
-- 调用方附带的 `Authorization`、`x-api-key`、Cookie 等不会转发给上游；上游只收到中继缓存的令牌和必要协议头。
-- 内部令牌接收接口使用每次启动随机生成的密钥，只有本次运行的 mitmproxy 插件持有，其他程序无法注入伪造令牌。
-- **使用前提**：网关对本机所有进程开放。同一 Windows 用户下的程序本来就能用 DPAPI 解密令牌缓存，因此免密钥不扩大这部分暴露面；但同一台电脑上**其他 Windows 用户**的程序也能通过 `127.0.0.1` 使用你的模型额度。请勿在多人共用的电脑或服务器上运行。
-- 不记录原始访问令牌、Cookie 或对话正文。`.local/`、`.venv/` 和环境变量文件已被排除在版本控制之外，不应上传本机运行状态。
-
-## 接口与状态检查
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:19324/healthz
-```
-
-`status: ok` 表示网关已启动。`upstreamAuthenticated: true` 仅表示存在尚未按到期时间判定过期的缓存令牌，不代表刚完成了一次上游鉴权；实际可用性以模型接口响应为准。
-
-| 本地接口 | 用途 |
-| --- | --- |
-| `GET /healthz` | 健康检查与令牌到期状态，不返回令牌 |
-| `GET /v1/models` | 原样转发上游模型列表，供调用方动态查询 |
-| `POST /v1/messages` | Claude 系列的 Messages 请求，支持 SSE 流式响应 |
-| `POST /v1/responses` | GPT 系列的 Responses 请求，支持 SSE 流式响应 |
-
-`/v1/models` 返回的是 Copilot 模型列表格式（`data[].id`、`name`、`supported_endpoints`、`capabilities`），不是 Anthropic 或 OpenAI 的原生格式。只读取 `data[].id` 的客户端可以直接使用。`supported_endpoints` 为 `/v1/messages` 的模型调用本地 `/v1/messages`，为 `/responses` 的模型调用本地 `/v1/responses`。
-
-上游不提供 Chat Completions 接口：GPT 模型只能走 Responses，`store` 须为 `false`，多轮对话要由客户端回传完整上下文；流式响应中会多出一个自定义事件 `llmapi.call_cost`，标准客户端会忽略它。
+- 在 VS Code 模型选择器的 **Effort Level** 中切换强度；传入模型不支持的档位会返回 400。
+- **Claude**：以 `"output_config": {"effort": "high"}` 发送，可选 `low` 到 `max`。上游只接受 `"thinking": {"type": "adaptive"}`，`enabled`（带 `budget_tokens`）和 `disabled` 都会返回 400；不传 `thinking` 时同样会自适应思考。
+- **GPT**：以 `"reasoning": {"effort": "high"}` 发送，多数模型还支持 `none`（`gpt-61-sol` 不支持）。
+- 上下文窗口：Claude 为 1000000，GPT 为 1050000。模型列表不返回最大输出长度：Claude 的 `max_tokens` 超过 128000 会被拒绝；GPT 的 `max_output_tokens` 上游不校验，128000 只是沿用的值，并非已验证的上限。
 
 ### Codex CLI
 
-Codex 只支持 Responses 协议，因此只能使用 GPT 模型。自定义 provider 不会查询 `/v1/models`，模型元数据来自 Codex 内置列表；未知模型名按前缀匹配，匹配不到时上下文窗口按 272000 处理。可在 `~/.codex/config.toml` 中这样配置（未在本机实测）：
+Codex 只支持 Responses 协议，因此只能使用 GPT 模型。在 `~/.codex/config.toml` 中配置（未在本机实测）：
 
 ```toml
 model = "gpt-5.6-sol"
@@ -213,13 +258,32 @@ wire_api = "responses"
 env_key = "COPILOT_APP_PROXY_KEY"
 ```
 
-`env_key` 指向的环境变量可以填任意非空值，网关不校验它，也不会转发给上游。
+`COPILOT_APP_PROXY_KEY` 环境变量填任意非空值即可。Codex 不查询 `/v1/models`，模型信息来自其内置列表；匹配不到的模型按 272000 的上下文窗口处理。
 
-上游没有 `count_tokens` 接口（返回 `NonExistentApi`），网关不提供该路由。
+### 本地接口
 
-生产上游固定为 `https://loki.delve.office.com/api/v1/llmapi/`。代理补齐必需的客户端、会话和 API 版本请求头，API 版本默认使用已验证的 `2026-10-21`；上游更新后可能需要调整。
+| 接口 | 用途 |
+| --- | --- |
+| `GET /healthz` | 网关状态与令牌到期时间（不返回令牌） |
+| `GET /v1/models` | 原样返回上游模型列表 |
+| `POST /v1/messages` | Claude 系列，支持 SSE 流式 |
+| `POST /v1/responses` | GPT 系列，支持 SSE 流式 |
 
-## 开发测试
+- `/v1/models` 是 Copilot 自己的格式（`data[].id`、`name`、`supported_endpoints`、`capabilities`），不是 Anthropic 或 OpenAI 的格式；只读取 `data[].id` 的客户端可以直接使用。
+- 上游没有 Chat Completions 和 `count_tokens` 接口。GPT 只能走 Responses，`store` 须为 `false`，多轮对话由客户端回传完整上下文；流式响应中会多一个自定义事件 `llmapi.call_cost`，标准客户端会忽略。
+- `/healthz` 中的 `upstreamAuthenticated: true` 只表示缓存的令牌按 `exp` 尚未过期，能否调用以模型接口的实际响应为准。
+- 上游固定为 `https://loki.delve.office.com/api/v1/llmapi/`。网关会补齐客户端、会话和 API 版本请求头，API 版本默认 `2026-10-21`；上游更新后可能需要调整。
+
+## 安全说明
+
+- **只对本机开放**：网关和代理只监听 `127.0.0.1`。模型接口不需要密钥，但会拒绝带浏览器 `Origin` 头、非本机 `Host` 或带查询参数的请求，网页无法借用。
+- **多用户电脑不适用**：同一台电脑上**其他 Windows 用户**的程序也能访问 `127.0.0.1`，从而使用你的模型额度。请勿在多人共用的电脑或服务器上运行。
+- **令牌的去向**：只截取发往 `loki.delve.office.com/api/v1/llmapi/` 的请求里的访问令牌，不收集 Cookie 或刷新令牌。令牌只存在于网关内存和 `.local/token.dpapi`（用当前 Windows 用户的 DPAPI 加密，换用户或换电脑无法解密），不会通过本地接口返回，也不写入日志。
+- **调用方凭据不外传**：调用方附带的 `Authorization`、`x-api-key`、Cookie 等不会转发给上游；上游只收到中继的令牌和必要的协议头。
+- **无法注入伪造令牌**：网关接收令牌的内部接口使用每次启动随机生成的密钥，只有本次运行的代理插件持有，且不写入磁盘。
+- **不要分享 `.local/`**：其中包含临时 CA 私钥、令牌缓存和日志；`.gitignore` 已将其排除。
+
+## 开发
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
@@ -227,98 +291,52 @@ env_key = "COPILOT_APP_PROXY_KEY"
 .\.venv\Scripts\python.exe -m ruff check copilot_app_proxy tests
 ```
 
-测试只使用模拟请求和临时测试缓存，不需要真实账号、令牌或模型额度。
+测试只使用模拟请求和临时缓存，不需要真实账号、令牌或模型额度。
 
-## 目录结构
-
-```text
-copilot-app-proxy/
-  README.md                 本文档
-  API-DISCOVERY.md          API 调查记录与适用范围
-  config.json               网关和代理的默认端口
-  pyproject.toml            项目配置、依赖与 copilot-proxy 入口
-  install.ps1               查找 Python 3.12+ 并执行 install
-  copilot_app_proxy/        核心库，不依赖 cli 子包
-    gateway.py              aiohttp 网关：本机请求校验、路由、请求头组装与 JSON/SSE 转发
-    relay_store.py          内存与 DPAPI 令牌缓存、到期判断与令牌错误类型
-    relay_addon.py          mitmproxy 插件：提取访问令牌并推送给网关
-    dpapi.py                Windows DPAPI 加解密（crypt32.dll）
-    cli/                    copilot-proxy 命令行
-      __main__.py           参数解析与命令分发
-      config.py             项目路径、端口解析与运行记录
-      bootstrap.py          install：创建 .venv 并安装依赖
-      launcher.py           start / stop：进程编排、证书信任与 Copilot 重启
-      windows.py            Windows 进程查询、证书操作、进程存活检测与启停锁
-      diagnostics.py        status / doctor / vscode-config
-      server.py             start 在后台拉起的网关进程（内部命令 serve）
-  tests/                    自动化测试套件
-  .local/                   本机加密状态、日志与临时证书，禁止提交
-  .venv/                    项目 Python 环境，禁止提交
-```
-
-源码中不包含本机运行状态。请勿分享 `.local/`、`.venv/`、环境变量文件、证书私钥、DPAPI 缓存或日志；`.gitignore` 已排除这些内容。
-
-## 整体架构
-
-代理包含两条独立链路：Copilot App 负责登录及更新令牌；VS Code 负责组织模型请求、执行工具和管理自己的 agent 流程。两者不共享 harness 或对话状态。
+### 架构
 
 ```mermaid
 flowchart LR
-  App["Copilot App<br/>本人账号登录与令牌刷新"]
-  VSCode["VS Code / 本机程序<br/>Agent、工具与对话管理"]
-  Upstream["Microsoft FX Gateway<br/>模型 API"]
+  App["Copilot App<br/>本人登录与令牌续签"]
+  Client["VS Code / 本机程序"]
+  Upstream["模型 API<br/>loki.delve.office.com"]
 
-  subgraph Local["本机代理"]
-    Relay["mitmproxy · 127.0.0.1:19323<br/>relay_addon.py"]
-    subgraph Gateway["Python aiohttp 网关 · 127.0.0.1:19324 · gateway.py"]
-      Ingest["POST /_internal/token<br/>本次运行的内部接收密钥"]
-      API["/v1/messages · /v1/responses · /v1/models<br/>仅限本机，无需密钥"]
-      Store["RelayTokenStore<br/>内存令牌与到期判断"]
+  subgraph Local["本机（copilot-proxy start）"]
+    Relay["mitmproxy :19323<br/>relay_addon.py"]
+    subgraph Gateway["网关 :19324 · gateway.py"]
+      Ingest["POST /_internal/token<br/>本次运行的内部密钥"]
+      API["/v1/messages · /v1/responses · /v1/models"]
+      Store["RelayTokenStore<br/>内存 + DPAPI 缓存"]
     end
-    DPAPI["dpapi.py<br/>Windows CurrentUser 加解密"]
-    Cache[(".local/token.dpapi")]
+    Keepalive["自动续期<br/>keepalive.py"]
   end
 
-  App -->|"原有 HTTPS 请求"| Relay
-  Relay -->|"转发原请求"| Upstream
-  Relay -.->|"目标 API 的访问令牌"| Ingest
-  Ingest -->|"更新缓存"| Store
-  Store <-->|"保存 / 恢复"| DPAPI
-  DPAPI <--> Cache
-  VSCode -->|"Messages / Responses 请求"| API
-  API -->|"读取当前令牌"| Store
-  API -->|"Bearer + 必要协议头"| Upstream
-  Upstream -->|"JSON / SSE"| API
-  API -->|"原样转发响应流"| VSCode
+  App -->|"HTTPS 请求"| Relay -->|"原样转发"| Upstream
+  Relay -.->|"访问令牌"| Ingest --> Store
+  Client --> API -->|"令牌 + 协议头"| Upstream
+  Store -.-> API
+  Keepalive -.->|"查询到期时间"| Gateway
+  Keepalive -.->|"快到期时重启并打开 Code 页"| App
 ```
 
-### 请求与令牌流程
-
-1. **启动**：`copilot-proxy start` 生成仅本次运行使用的内部接收密钥，在后台启动网关和 mitmproxy。网关加载 DPAPI 令牌缓存（如有）。临时 CA 只加入当前用户证书库，代理配置只传给新启动的 Copilot App 进程。
-2. **令牌更新**：Copilot App 正常请求模型 API 时，插件只提取目标域名及路径下的 Bearer 令牌，推送给 `/_internal/token`。网关更新内存及 DPAPI 缓存后返回成功，插件才标记该令牌已送达。
-3. **失败重试**：内部推送最多等待 3 秒。失败时不标记已送达，下次匹配的 Copilot 请求会重试同一令牌；没有额外轮询或后台刷新任务。
-4. **独立推理**：VS Code 等本机程序直接提交请求，网关取出当前令牌，补齐 API 版本、会话及客户端头，再向固定上游发起独立请求。请求体及工具定义不做协议转换。
-5. **流式返回**：网关用 `aiohttp` 流式转发上游响应，保留 SSE 数据和背压；客户端断开时关闭对应上游请求。mitmproxy 的响应也采用流式转发。
-6. **过期与停止**：网关读取 JWT 的 `exp` 进行本地到期判断，真正的验签和授权由上游负责。令牌缺失或过期时返回 `401`，提示在 Copilot App 中触发更新。`stop` 关闭代理、删除临时 CA 并恢复 Copilot App，保留 DPAPI 缓存。
-
-### 模块职责
+- **启动**：`start` 以独立后台进程启动网关、mitmproxy 和自动续期，输出写入 `.local/logs/`，运行记录写入 `.local/pids.json`，供 `stop` 和 `status` 使用。
+- **令牌**：插件把令牌推送到网关的内部接口；推送失败时不标记已送达，下一个请求会重试。网关按 JWT 的 `exp` 判断是否过期，缺失或过期时返回 `401`。
+- **转发**：请求体和工具定义不做协议转换；响应用 `aiohttp` 流式转发，保留 SSE 和背压，客户端断开时同时关闭上游请求。
 
 | 模块 | 职责 |
 | --- | --- |
-| `gateway.py` | 本机请求校验、接口路由、请求头组装、JSON/SSE 转发与错误映射 |
-| `relay_store.py` | 令牌缓存、到期判断、DPAPI 持久化，以及令牌缺失/过期/持久化失败等错误 |
-| `relay_addon.py` | 定向提取访问令牌、向内部接口推送、成功后去重；不解析 JWT、不管理刷新 |
-| `dpapi.py` | 用当前 Windows 用户身份（`crypt32.dll`）加解密本机缓存 |
-| `cli/launcher.py` / `cli/windows.py` | 管理进程、临时证书和 Copilot 代理配置 |
-| `cli/diagnostics.py` | 状态检查、环境诊断与 VS Code 配置生成 |
-| `cli/config.py` | 项目路径、端口解析和运行记录 |
-| `cli/server.py` | 由 `start` 在后台调用，组装令牌缓存并运行网关 |
+| `copilot_app_proxy/gateway.py` | 本机请求校验、路由、请求头组装、JSON/SSE 转发、错误映射与可选的请求日志 |
+| `copilot_app_proxy/relay_store.py` | 令牌缓存、到期判断与 DPAPI 持久化 |
+| `copilot_app_proxy/relay_addon.py` | mitmproxy 插件：截取令牌推送给网关；可选的观察日志 |
+| `copilot_app_proxy/dpapi.py` | 调用 Windows DPAPI 加解密 |
+| `cli/__main__.py` | 命令行参数与分发 |
+| `cli/launcher.py` | `start` / `stop`：进程编排、证书信任、Copilot App 重启与清理 |
+| `cli/foreground.py` | 前台视图：汇总各进程日志并着色、底部状态栏与窗口标题、关闭窗口时的快速恢复 |
+| `cli/ansi.py` | 终端颜色：检测是否支持 ANSI、遵循 `NO_COLOR` |
+| `cli/keepalive.py` | `refresh` / `keepalive`：重启 App 并打开 Code 页以取得新令牌 |
+| `cli/windows.py` | Windows 进程查询、证书操作、启停锁与 Code 页的 UI 自动化 |
+| `cli/diagnostics.py` | `status` / `doctor` / `vscode-config` |
+| `cli/server.py` | 网关进程入口（内部命令 `serve`），写入并轮转 `gateway.log` |
+| `cli/config.py` / `cli/bootstrap.py` | 路径、端口与运行记录；`install` |
 
-核心库不依赖 `cli` 子包。其他 Python 程序可直接使用 `create_app(relay_store=..., relay_ingest_secret=...)` 和 `listen(app, port)` 嵌入网关；单独加载 mitmproxy 插件时，必须显式提供 `RELAY_INGEST_URL` 和 `RELAY_INGEST_SECRET`，否则插件不会推送令牌。桌面启停和 DPAPI 持久化仅支持 Windows。
-
-### 凭据边界
-
-- **模型接口**不需要密钥，仅接受本机 Host、不带浏览器 Origin 的请求；调用方附带的凭据不会转发给模型服务。
-- **内部接收密钥**仅由本次运行的插件和网关共享，用于令牌更新接口，不交给 VS Code，也不落盘。
-- **上游访问令牌**只在插件、网关内存、DPAPI 缓存及固定目标 API 之间流转，不由本地接口返回。
-- `/healthz` 只提供运行及缓存到期状态；缓存可用不等于上游必然接受该令牌。
+核心库（`copilot_app_proxy/` 下除 `cli/` 外的模块）不依赖 `cli`。其他程序可以用 `create_app(relay_store=..., relay_ingest_secret=...)` 和 `listen(app, port)` 嵌入网关；单独加载 mitmproxy 插件时，需要设置 `RELAY_INGEST_URL` 和 `RELAY_INGEST_SECRET` 环境变量，否则插件不会推送令牌。

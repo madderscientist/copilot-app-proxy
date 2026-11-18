@@ -181,6 +181,13 @@ def run_status(root: Path, gateway_port: int | None = None) -> int:
         f"MITM Proxy (127.0.0.1:{proxy_port}): {'RUNNING' if proxy_running else 'STOPPED'}"
         + (f" (PID {mitm_pid})" if mitm_alive else "")
     )
+    keepalive_pid = pids.get("keepalivePid")
+    if keepalive_pid is not None:
+        keepalive_alive = _alive(keepalive_pid)
+        print(
+            f"Keep-alive: {'RUNNING' if keepalive_alive else 'STOPPED'}"
+            + (f" (PID {keepalive_pid})" if keepalive_alive else "")
+        )
     print(
         f"Temp CA Trusted: {'YES' if ca_trusted else 'NO'}"
         + (f" ({thumb[:12]}...)" if thumb else "")
@@ -193,7 +200,9 @@ def run_status(root: Path, gateway_port: int | None = None) -> int:
         state = "READY" if authenticated else "MISSING/EXPIRED"
         print(f"Upstream Token: {state} (exp={expires}{remaining})")
         if not authenticated:
-            print("  -> 在 Copilot App 的 Code 页发送一条消息即可自动捕获令牌。")
+            print("  -> 运行 copilot-proxy refresh，或在 Copilot App 的 Code 页发送一条消息。")
+    elif pids or ca_trusted:
+        print("  -> 上次运行没有完整清理：运行 copilot-proxy stop 移除临时 CA 并恢复 Copilot App。")
     else:
         print("  -> 运行 copilot-proxy start 启动代理。")
     return 0 if health else 1
@@ -243,7 +252,7 @@ def run_doctor(root: Path, gateway_port: int, proxy_port: int) -> int:
         else:
             warn("Proxy Port", f"127.0.0.1:{proxy_port} 已被其他进程占用")
 
-    for log_name in ("gateway.log", "mitm.log"):
+    for log_name in ("gateway.log", "mitm.log", "keepalive.log"):
         log_path = local / "logs" / log_name
         if log_path.is_file() and log_path.stat().st_size > 0:
             ok(f"Log ({log_name})", str(log_path))

@@ -156,7 +156,7 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 
 本机网关只接受来自 loopback 且不带浏览器 Origin 的请求，调用方无需密钥；令牌接收接口使用每次启动随机生成的内部密钥，只有本次运行的插件持有。VS Code 不接收云端访问令牌。访问令牌保存在内存和当前 Windows 用户范围的 DPAPI 加密缓存中，不以明文落盘或写入日志。
 
-令牌过期时，需要 Copilot App 取得新令牌，并通过后续请求让中继更新缓存。中继并不保证应用关闭后还能无限续期。
+令牌过期时，需要 Copilot App 取得新令牌，并通过后续请求让中继更新缓存。中继并不保证应用关闭后还能无限续期。如何在不读取应用凭据的前提下让应用自己续期，见第九节。
 
 ## 八、按服务端错误补齐协议条件
 
@@ -188,7 +188,89 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 
 这些头部说明的是当时的协议要求，不代替 Bearer 令牌，也不会赋予额外权限。
 
-## 九、验证范围与未完成事项
+## 九、令牌续期调查
+
+2026-11-18 调查。目标是不读取应用的凭据缓存或进程内存，只通过 UI 操作让 Copilot App 自己发出带新令牌的请求。
+
+### 参考方案与不可行的路线
+
+[caozhiyuan/copilot-api](https://github.com/caozhiyuan/copilot-api) 能自行续期，是因为它持有长期的 GitHub OAuth token，可以按 `refresh_in` 反复调用 `copilot_internal/v2/token` 换取短期令牌。本项目只截获到短期的 Bearer 访问令牌；刷新凭据在 Copilot App 或 Windows WAM/MSAL 手中。自行刷新就必须读取这些缓存，或冒用第一方应用的 client_id，越过了第七节的凭据边界，因此不采用。
+
+### 观察方法
+
+`copilot-proxy start --observe` 让插件把发往 `loki.delve.office.com` 的请求元数据追加到 `.local/logs/observe.jsonl`：时间、方法、路径（去掉查询参数）、状态码、令牌 SHA-256 的前 12 位，以及 JWT 的 `iat`/`nbf`/`exp`。不记录令牌、其他声明或正文。UI 操作通过 Windows UI Automation 完成：Code 页是 `TabItem`，支持 `SelectionItemPattern`；模型选择器等按钮支持 `ExpandCollapsePattern`。
+
+### 哪些操作会带出模型 API 令牌
+
+同一主机上有两类令牌：`/api/v2/configuration` 使用的令牌与 `/api/v1/llmapi/` 使用的令牌不同（`tokenId` 和 `exp` 都不同），前者不能用于模型 API。
+
+| 操作 | 是否请求 `llmapi` |
+| --- | --- |
+| 应用启动（默认停在 Chat 页） | 否，只请求 `configuration` |
+| 启动后第一次选中 Code 页 | 是，`GET /api/v1/llmapi/models`，约 2–10 秒内连续 3 次 |
+| Code 页发送消息 | 是（最初截获令牌的方式；消耗额度并留下会话） |
+| 再次切换 Chat / Code 页 | 否 |
+| 展开模型选择器 | 否 |
+| 新建会话、新建项目会话、切换运行位置 | 否 |
+| 结束 `copilot.exe` 运行时，再进入 Code 页（运行时被重新拉起） | 否 |
+| `F5`、`Ctrl+R` | 否，页面不重新加载 |
+| 应用闲置 28 分钟（14:16:42–14:44:51，停在 Code 页） | 否，主机上没有任何请求 |
+| 应用闲置到模型令牌过期（14:50–15:49） | 否，见下文“闲置到期实验” |
+| 选中 Cowork 页 | 否（15:51，仅 `--proxy-server` 启动，观察链路不完整，结论待复核） |
+
+未测试：打开已有历史会话、实际切换模型（只展开过模型菜单）。
+
+由此可得不消耗额度的触发方式：在代理下重启 Copilot App，再选中 Code 页。
+
+### 应用何时换新令牌
+
+应用会复用缓存中的令牌，只在快到期时换新：
+
+| 时间 | 令牌 | 剩余有效期 | 结果 |
+| --- | --- | --- | --- |
+| 14:13 | `configuration`，`exp` 14:19:57 | 约 7 分钟 | 沿用 |
+| 14:16:34 | 同上 | 约 3.5 分钟 | 换新，`exp` 15:34:04 |
+| 14:04–14:17 多次 | `llmapi`，`exp` 14:48:44 | 30–44 分钟 | 均沿用 |
+| 14:44:43 | 同上 | 240 秒 | 换新，`exp` 15:45:58；20 秒后网关完成更新 |
+
+两类令牌行为一致，换新区间约为到期前 5 分钟，与 MSAL 的默认刷新提前量相符。新令牌的 `iat` 比实际签发时间早约 5 分钟，有效期约 66–92 分钟（`exp` 减 `iat`）。
+
+### 实现与验证
+
+据此实现了 `copilot-proxy refresh` 和 `copilot-proxy keepalive`（[keepalive.py](copilot_app_proxy/cli/keepalive.py)）。`keepalive` 在剩余不足 240 秒时重启应用并选中 Code 页，以网关 `/healthz` 中的 `tokenExpiresOn` 是否变化判断成功；未拿到新令牌时每 60 秒重试，最多 5 次。14:44:43 的实测在到期前完成续期，续期后 `/v1/models` 返回 200。
+
+调查中发现的问题：
+
+- 第一版读取了 `/healthz` 中不存在的 `hasToken` 字段（实际为 `upstreamAuthenticated`），导致在令牌还剩 44 分钟时连续重启；已修正并补充测试。
+- 一次重启后 60 秒内没有找到 Code 页，下一次重试恢复。
+
+### 闲置到期实验（2026-11-18）
+
+14:50 停止 `keepalive`，观察日志已有 56 行，模型令牌于 15:45:58 到期。15:49 检查时，日志没有新增请求，网关 `/healthz` 返回 `upstreamAuthenticated: false`、`expiresInSeconds: 0`，到期时间仍为原值。
+
+因此，本次实验没有观察到 App 在闲置到期时主动发送可供中继更新令牌的请求。不能由此断言 App 内部没有刷新凭据，也不能推广为所有版本都不会自动刷新。
+
+随后一次恢复命令在中止前关闭了 App，但尚未重新启动，原有的“不重启”实验现场已丢失。
+
+### `llmapi` 请求不是网页发出的
+
+15:50 只给 `copilotapp.exe` 传入 `--proxy-server`（未设置 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量）重新启动：页面的 `configuration` 请求经过了代理，Code 页也正常显示了模型列表，但中继没有捕获任何 `llmapi` 请求。16:05 改用 `copilot-proxy start`（同时设置命令行参数和环境变量）启动，进入 Code 页后立即捕获到 3 次 `GET /api/v1/llmapi/models`，令牌恢复可用。
+
+由此推断，模型 API 请求由读取环境变量代理设置的子进程（`copilotapphost.exe` 或 `copilot.exe`）发出，Chromium 的 `--proxy-server` 只影响页面。启动器必须同时设置两者；只走 `--proxy-server` 的观察链路不完整，在这种链路下看不到请求不能说明 UI 操作没有触发请求。
+
+### 运行方式的取舍
+
+续期最终做成与网关、mitmproxy 并列的独立后台进程，由 `start` 启动、`stop` 结束；`start` 默认留在前台显示三者的日志和一行状态栏，`--detach` 时启动后即返回，两种方式运行的内容相同。为避免清理不完整时残留的续期进程反复重启 App，续期进程连续约 30 秒连不上网关就自行退出。
+
+前台运行时直接关闭终端窗口，Windows 只给约 5 秒：程序先让 Copilot App 恢复直连，再结束各进程；临时 CA 的删除需要确认，留给之后的 `stop`。
+
+### 待验证
+
+- 在模型令牌已过期、App 未重启且完整观察链路仍有效时，打开历史会话、实际切换模型等操作是否触发新令牌请求。仅展开模型菜单与实际切换模型不能混为一谈。
+- 独立续期进程、前台视图（日志着色、状态栏、Ctrl+C 清理）和关闭终端窗口的恢复路径，目前只有单元测试，尚未端到端实测。
+- 续期会重启应用，应用内正在进行的任务会中断；锁屏、休眠或需要重新登录时无法自动续期。
+
+## 十、验证范围与未完成事项
 
 已验证：
 
@@ -217,7 +299,7 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 - 上述上限与推理选项同样适用于未来的模型或版本。
 - 健康检查显示缓存令牌未过期，就意味着上游一定接受它。
 
-## 十、当前代码与后续维护
+## 十一、当前代码与后续维护
 
 当前架构和日常启动、停止、VS Code 配置见 [README.md](README.md)。主要实现位于：
 
@@ -225,5 +307,7 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 - [gateway.py](copilot_app_proxy/gateway.py) 与 [relay_store.py](copilot_app_proxy/relay_store.py)：模型请求入口、令牌缓存、必要协议头和 JSON/SSE 转发。
 - [dpapi.py](copilot_app_proxy/dpapi.py)：Windows 当前用户范围的加密读写。
 - [launcher.py](copilot_app_proxy/cli/launcher.py) 与 [windows.py](copilot_app_proxy/cli/windows.py)：进程级代理、临时证书和应用启动方式的管理。
+- [keepalive.py](copilot_app_proxy/cli/keepalive.py)：`refresh` / `keepalive`，通过重启应用并选中 Code 页让应用自己续期。
+- [foreground.py](copilot_app_proxy/cli/foreground.py)：`start` 的前台视图，汇总各进程日志并显示状态栏。
 
 后续排查应先区分三层：本机代理是否运行、目标令牌是否仍可用、服务协议是否变化。不要仅凭健康检查或某个静态字符串就认定模型调用已经成功，也不要把临时 API 错误直接归因于账号无权限。

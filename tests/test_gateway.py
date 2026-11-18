@@ -378,7 +378,63 @@ async def test_relay_missing_and_expired_token_errors_preserve_copilot_instructi
                 msg = result["error"]["message"]
                 assert ("has expired" if expired else "No Copilot upstream token") in msg
                 assert "Copilot App" in msg
-                assert "Code 页发送一次消息" in msg
+                assert "copilot-proxy refresh" in msg
                 assert "--login" not in msg
                 assert relay_store.status()["hasToken"] is False
         assert upstream_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_access_log_records_metadata_without_secrets():
+    lines: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        await request.read()
+        return web.Response(text="data: {}\n\n", content_type="text/event-stream")
+
+    async with gateway_fixture(handler, log=lines.append) as (url, client):
+        async with client.post(
+            f"{url}/v1/messages",
+            json={"model": "claude-opus-5.5", "stream": True, "messages": [{"role": "user",
+                  "content": "private prompt"}]},
+        ) as resp:
+            assert resp.status == 200
+            await resp.read()
+        async with client.get(f"{url}/v1/models", headers={"origin": "https://x"}) as rejected:
+            assert rejected.status == 403
+        async with client.get(f"{url}/healthz") as health:
+            assert health.status == 200  # Health probes are not logged.
+        jwt_token = _make_jwt(int(time.time()) + 3600)
+        async with client.post(
+            f"{url}/_internal/token",
+            headers={"x-relay-secret": RELAY_SECRET},
+            json={"token": jwt_token},
+        ) as ingest:
+            assert ingest.status == 200
+
+    assert re.fullmatch(
+        r"POST /v1/messages model=claude-opus-5\.5 stream=true -> 200 "
+        r"headers=\d+\.\d\ds total=\d+\.\d\ds",
+        lines[0],
+    )
+    assert lines[1] == "GET /v1/models -> 403" + lines[1].split("-> 403")[1]
+    assert lines[2].startswith("Token updated: exp=")
+    assert len(lines) == 3
+    joined = "\n".join(lines)
+    for secret in ("private prompt", SYNTHETIC_TOKEN, jwt_token, RELAY_SECRET):
+        assert secret not in joined
+
+
+def test_gateway_log_file_is_cleared_and_timestamped(tmp_path):
+    from copilot_app_proxy.cli.server import _logger
+
+    log_file = tmp_path / "logs" / "gateway.log"
+    log_file.parent.mkdir()
+    log_file.write_text("previous run\n", encoding="utf-8")
+    (tmp_path / "logs" / "gateway.log.1").write_text("old backup\n", encoding="utf-8")
+    logger = _logger(log_file)
+    logger.info("hello")
+    for handler in logger.handlers:
+        handler.close()
+    assert re.fullmatch(r"\d\d:\d\d:\d\d hello\n", log_file.read_text(encoding="utf-8"))
+    assert not (tmp_path / "logs" / "gateway.log.1").exists()
