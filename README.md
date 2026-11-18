@@ -1,6 +1,6 @@
 # Copilot App 本机代理
 
-将本机 Copilot App 的模型访问中继到本地 Messages API，供 VS Code 等客户端使用。代理转发请求和 SSE 流，不运行 Copilot CLI 的 agent 或工具执行流程，工具定义、执行和确认仍由 VS Code 负责。
+将本机 Copilot App 的模型访问中继到本地模型 API（Claude 用 Messages，GPT 用 Responses），供 VS Code 等客户端使用。代理转发请求和 SSE 流，不运行 Copilot CLI 的 agent 或工具执行流程，工具定义、执行和确认仍由 VS Code 负责。
 
 仅限组织允许的本人账号会话复用。安装成功不等于获得模型权限；不同账号、组织、地区和 Copilot 版本的服务及模型可用性可能不同。本项目不是微软官方集成，也不提供账号、订阅或令牌。
 
@@ -10,8 +10,8 @@ API 调查过程和已验证的适用范围见 [API-DISCOVERY.md](API-DISCOVERY.
 
 - 网关默认监听 `http://127.0.0.1:19324`，本机程序调用无需密钥。
 - Copilot App 的 HTTPS 代理默认监听 `http://127.0.0.1:19323`。
-- 已实测通过本地网关获取模型列表，并调用 `claude-opus-5.5` 返回 `200`。
-- 自动化测试覆盖 Messages 转发、SSE、凭据隔离、错误处理和 DPAPI 缓存。VS Code 完整 agent 工作流仍需按实际配置验证。
+- 已实测通过本地网关获取模型列表，并调用 Claude 和 GPT 系列模型（含流式与工具调用）返回 `200`。
+- 自动化测试覆盖 Messages 与 Responses 转发、SSE、凭据隔离、错误处理和 DPAPI 缓存。VS Code 完整 agent 工作流仍需按实际配置验证。
 
 ## 环境要求
 
@@ -116,13 +116,13 @@ git pull --ff-only
 
 ## 接入 VS Code
 
-在聊天的模型管理中选择 **Add Models → Custom Endpoint**，API 类型选择 **Messages**。以下命令按当前端口生成配置：
+在聊天的模型管理中选择 **Add Models → Custom Endpoint**。VS Code 的 Custom Endpoint 不会自行查询模型列表，需要在配置里逐个列出模型，每个模型单独指定 URL 和 API 类型。以下命令按当前端口生成配置：
 
 ```powershell
 .\.venv\Scripts\copilot-proxy.exe vscode-config
 ```
 
-默认端口下的输出如下：
+命令会通过网关读取 `GET /v1/models`，按上游的 `supported_endpoints` 选择接口：Claude 系列走 `/v1/messages`（`apiType: messages`），GPT 系列走 `/v1/responses`（`apiType: responses`），名称、上下文窗口和强度档位都取自上游。网关未启动或令牌已过期时，会在 stderr 给出提示，并输出内置的模型列表。默认端口下 Claude 和 GPT 模型的配置分别如下（同系列的其他模型只有 `id`、`name` 和强度档位可能不同）：
 
 ```json
 [
@@ -133,16 +133,27 @@ git pull --ff-only
     "models": [
       {
         "id": "claude-opus-5.5",
-        "name": "claude-opus-5.5 (本机代理)",
+        "name": "Claude Opus 5.5 (本机代理)",
         "url": "http://127.0.0.1:19324/v1/messages",
         "apiType": "messages",
         "toolCalling": true,
         "vision": false,
         "thinking": true,
         "adaptiveThinking": true,
-        "supportsReasoningEffort": ["low", "medium", "high", "xhigh", "max"],
         "contextWindow": 1000000,
-        "maxOutputTokens": 128000
+        "maxOutputTokens": 128000,
+        "supportsReasoningEffort": ["low", "medium", "high", "xhigh", "max"]
+      },
+      {
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6 Sol (本机代理)",
+        "url": "http://127.0.0.1:19324/v1/responses",
+        "apiType": "responses",
+        "toolCalling": true,
+        "vision": false,
+        "contextWindow": 1050000,
+        "maxOutputTokens": 128000,
+        "supportsReasoningEffort": ["none", "low", "medium", "high", "xhigh", "max"]
       }
     ]
   }
@@ -151,9 +162,10 @@ git pull --ff-only
 
 ### 思考强度与上限
 
-- 思考强度在 VS Code 模型选择器的 **Effort Level** 中切换，请求以 `output_config.effort` 发送，可选 `low`、`medium`、`high`、`xhigh`、`max`。直接调用接口时在请求体中加入 `"output_config": {"effort": "high"}` 即可。
-- 上游只接受 `"thinking": {"type": "adaptive"}`；`enabled` 加 `budget_tokens` 和 `disabled` 都会返回 400。不传 `thinking` 时模型同样会自适应思考。
-- 上下文窗口 1000000 来自 `GET /v1/models` 的 `capabilities.limits.max_context_window_tokens`，支持的强度档位也在 `capabilities.supports.reasoning_effort` 中。最大输出 128000 是实测值：模型列表不返回该字段，`max_tokens` 超过 128000 会被拒绝。
+- 思考强度在 VS Code 模型选择器的 **Effort Level** 中切换。各模型支持的档位来自 `GET /v1/models` 的 `capabilities.supports.reasoning_effort`，传入不支持的档位会返回 400。
+- **Claude**：请求以 `output_config.effort` 发送，可选 `low`、`medium`、`high`、`xhigh`、`max`，直接调用时在请求体中加入 `"output_config": {"effort": "high"}`。上游只接受 `"thinking": {"type": "adaptive"}`；`enabled` 加 `budget_tokens` 和 `disabled` 都会返回 400。不传 `thinking` 时模型同样会自适应思考。
+- **GPT**：请求以 `"reasoning": {"effort": "high"}` 发送，多数模型额外支持 `none`（`gpt-61-sol` 不支持）。
+- 上下文窗口来自 `capabilities.limits.max_context_window_tokens`：Claude 为 1000000，GPT 为 1050000。模型列表不返回最大输出：Claude 的 `max_tokens` 超过 128000 会被拒绝；GPT 的 `max_output_tokens` 上游不校验，配置中同样填 128000，并非已验证的上限。
 
 ## 令牌与安全边界
 
@@ -178,8 +190,30 @@ Invoke-RestMethod http://127.0.0.1:19324/healthz
 | 本地接口 | 用途 |
 | --- | --- |
 | `GET /healthz` | 健康检查与令牌到期状态，不返回令牌 |
-| `GET /v1/models` | 获取上游模型列表 |
-| `POST /v1/messages` | Messages 请求，支持 SSE 流式响应 |
+| `GET /v1/models` | 原样转发上游模型列表，供调用方动态查询 |
+| `POST /v1/messages` | Claude 系列的 Messages 请求，支持 SSE 流式响应 |
+| `POST /v1/responses` | GPT 系列的 Responses 请求，支持 SSE 流式响应 |
+
+`/v1/models` 返回的是 Copilot 模型列表格式（`data[].id`、`name`、`supported_endpoints`、`capabilities`），不是 Anthropic 或 OpenAI 的原生格式。只读取 `data[].id` 的客户端可以直接使用。`supported_endpoints` 为 `/v1/messages` 的模型调用本地 `/v1/messages`，为 `/responses` 的模型调用本地 `/v1/responses`。
+
+上游不提供 Chat Completions 接口：GPT 模型只能走 Responses，`store` 须为 `false`，多轮对话要由客户端回传完整上下文；流式响应中会多出一个自定义事件 `llmapi.call_cost`，标准客户端会忽略它。
+
+### Codex CLI
+
+Codex 只支持 Responses 协议，因此只能使用 GPT 模型。自定义 provider 不会查询 `/v1/models`，模型元数据来自 Codex 内置列表；未知模型名按前缀匹配，匹配不到时上下文窗口按 272000 处理。可在 `~/.codex/config.toml` 中这样配置（未在本机实测）：
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "copilot-app-proxy"
+
+[model_providers.copilot-app-proxy]
+name = "Copilot App 本机代理"
+base_url = "http://127.0.0.1:19324/v1"
+wire_api = "responses"
+env_key = "COPILOT_APP_PROXY_KEY"
+```
+
+`env_key` 指向的环境变量可以填任意非空值，网关不校验它，也不会转发给上游。
 
 上游没有 `count_tokens` 接口（返回 `NonExistentApi`），网关不提供该路由。
 
@@ -238,7 +272,7 @@ flowchart LR
     Relay["mitmproxy · 127.0.0.1:19323<br/>relay_addon.py"]
     subgraph Gateway["Python aiohttp 网关 · 127.0.0.1:19324 · gateway.py"]
       Ingest["POST /_internal/token<br/>本次运行的内部接收密钥"]
-      API["/v1/messages · /v1/models<br/>仅限本机，无需密钥"]
+      API["/v1/messages · /v1/responses · /v1/models<br/>仅限本机，无需密钥"]
       Store["RelayTokenStore<br/>内存令牌与到期判断"]
     end
     DPAPI["dpapi.py<br/>Windows CurrentUser 加解密"]
@@ -251,7 +285,7 @@ flowchart LR
   Ingest -->|"更新缓存"| Store
   Store <-->|"保存 / 恢复"| DPAPI
   DPAPI <--> Cache
-  VSCode -->|"Messages 请求"| API
+  VSCode -->|"Messages / Responses 请求"| API
   API -->|"读取当前令牌"| Store
   API -->|"Bearer + 必要协议头"| Upstream
   Upstream -->|"JSON / SSE"| API

@@ -1,4 +1,4 @@
-"""Comprehensive tests for the Python local Messages API gateway."""
+"""Comprehensive tests for the Python local model API gateway."""
 
 from __future__ import annotations
 
@@ -119,25 +119,36 @@ async def test_messages_forwarded_with_relayed_token_instead_of_caller_credentia
 
 
 @pytest.mark.asyncio
-async def test_models_path_mapped_without_caller_credentials():
+@pytest.mark.parametrize(
+    ("method", "path", "body", "upstream_path"),
+    [
+        ("GET", "/v1/models", None, "/api/v1/llmapi/models"),
+        ("POST", "/v1/responses", '{"model":"gpt-x","input":"hi"}', "/api/v1/llmapi/responses"),
+    ],
+)
+async def test_route_path_mapped_without_caller_credentials(method, path, body, upstream_path):
     captured: dict = {}
 
     async def handler(request: web.Request) -> web.Response:
+        captured["method"] = request.method
         captured["path"] = request.raw_path
         captured["authorization"] = request.headers.get("authorization")
-        return web.json_response({"data": [{"id": "claude-opus-5.5"}]})
+        captured["body"] = await request.text() or None
+        return web.json_response({"ok": True})
 
+    headers = {"authorization": f"Bearer {CALLER_CREDENTIAL}"}
     async with (
         gateway_fixture(handler) as (url, client),
-        client.get(f"{url}/v1/models") as resp,
+        client.request(method, f"{url}{path}", data=body, headers=headers) as resp,
     ):
         assert resp.status == 200
-        data = await resp.json()
-        assert data["data"][0]["id"] == "claude-opus-5.5"
+        assert await resp.json() == {"ok": True}
 
     assert captured == {
-        "path": "/api/v1/llmapi/models",
+        "method": method,
+        "path": upstream_path,
         "authorization": f"Bearer {SYNTHETIC_TOKEN}",
+        "body": body,
     }
 
 

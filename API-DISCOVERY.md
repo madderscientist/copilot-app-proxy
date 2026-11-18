@@ -12,9 +12,9 @@
 | 主机 | `loki.delve.office.com` |
 | 基础路径 | `/api/v1/llmapi/` |
 | 模型列表 | `GET /api/v1/llmapi/models` |
-| 模型请求 | `POST /api/v1/llmapi/v1/messages` |
-| 实测模型 ID | `claude-opus-5.5` |
-| 请求格式 | Anthropic Messages 风格 |
+| 模型请求 | Claude：`POST /api/v1/llmapi/v1/messages`；GPT：`POST /api/v1/llmapi/responses` |
+| 实测模型 ID | `claude-opus-5.5` 等 Claude 系列；`gpt-5.6-sol` 等 GPT 系列 |
+| 请求格式 | Anthropic Messages 风格；OpenAI Responses 风格 |
 | 响应 | JSON，或 `text/event-stream` SSE |
 | 认证 | Microsoft Entra Bearer 访问令牌 |
 | 已验证 API 版本 | `2026-10-21` |
@@ -183,7 +183,7 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
 | `X-Llm-Api-Version: 2026-10-21` | 根据服务错误提示选择，并经模型列表和推理请求验证 |
 | `X-ConversationId` | 模型请求缺失时被拒绝，代理默认生成 UUID，也允许调用方传入 |
 | `X-ClientCallId` | 观察到请求标识，代理按请求生成 UUID；未单独验证是否必需 |
-| `anthropic-version: 2023-06-01` | 原 Messages 请求中观察到，代理作为默认值沿用 |
+| `anthropic-version: 2023-06-01` | 原 Messages 请求中观察到，代理作为默认值沿用；随 Responses 请求一起发送时未见影响 |
 | `anthropic-beta` | 原请求中观察到；代理仅在调用方提供时转发，不固定启用实验功能 |
 
 这些头部说明的是当时的协议要求，不代替 Bearer 令牌，也不会赋予额外权限。
@@ -201,13 +201,20 @@ Copilot App 仍负责本人账号登录和获取新令牌。插件只处理目�
   - `output_config.effort` 接受上述五档，其他值返回 400；`max` 档的思考 token 明显增多。
   - `thinking` 只接受 `{"type": "adaptive"}`，`enabled` 加 `budget_tokens` 与 `disabled` 均返回 400；省略时响应仍包含思考块。
   - `v1/messages/count_tokens` 返回 404 `NonExistentApi`，上游不提供该接口。
+- 对 `claude-opus-5`、`claude-sonnet-5.5`、`claude-sonnet-5`、`claude-haiku-5.5` 重复了 adaptive 思考加 `effort=max` 请求，以及 `max_tokens` 128000/128001 边界测试，结果与 `claude-opus-5.5` 一致。模型列表中这些模型的上下文窗口和强度档位与 `claude-opus-5.5` 相同。
+- GPT 系列（`gpt-5.6-sol`、`gpt-5.6-luna`、`gpt-6-luna`、`gpt-61-sol`）的 `supported_endpoints` 只有 `/responses`，使用同一令牌和请求头：
+  - 上游路径为 `responses`（不带 `v1/`）。`v1/responses` 和 `v1/chat/completions` 返回 404；`chat/completions` 返回 400 `endpoint_model_mismatch`。网关把本地 `/v1/responses` 映射到上游 `responses`。
+  - 上下文窗口为 1050000；强度档位为 `none` 至 `max`，`gpt-61-sol` 没有 `none`。四个模型在 `reasoning.effort=max`、`max_output_tokens=128000` 下均返回 200，档位不支持时返回 400。
+  - `max_output_tokens` 为 128001、200000、1050001、5000000 时仍返回 200，上游不校验该字段，真实输出上限未知。
+  - SSE 流式正常，事件序列为标准 Responses 事件，另含自定义事件 `llmapi.call_cost`。
+  - 经本机网关验证了 VS Code 形态的请求（`store:false`、`include:["reasoning.encrypted_content"]`、`truncation`、`context_management` 压缩、`text.verbosity`、`prompt_cache_options`）和 Codex 形态的请求（`instructions`、`parallel_tool_calls`、`reasoning.summary`、`prompt_cache_key`）；包含工具调用和回传 `function_call_output` 的两轮对话均成功。
 
 未作保证：
 
 - 所有账号、组织、设备或未来应用版本都支持同样的调用方式。
 - API 是公开、稳定或不受客户端与组织政策限制的服务。
-- VS Code 的完整 agent 工作流、所有工具和图片输入都已端到端验证。
-- 上述上限与推理选项同样适用于其他模型或未来版本。
+- VS Code 的完整 agent 工作流、所有工具和图片输入都已端到端验证；Codex CLI 未在本机实测。
+- 上述上限与推理选项同样适用于未来的模型或版本。
 - 健康检查显示缓存令牌未过期，就意味着上游一定接受它。
 
 ## 十、当前代码与后续维护

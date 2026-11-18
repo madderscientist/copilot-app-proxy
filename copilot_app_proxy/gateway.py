@@ -1,4 +1,4 @@
-"""Local Messages API gateway that forwards loopback requests with the relayed Copilot token."""
+"""Local model API gateway that forwards loopback requests with the relayed Copilot token."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ CLIENT_SESSION_KEY = web.AppKey("http_client", aiohttp.ClientSession)
 # Local path -> (method, upstream path relative to the upstream base URL).
 MODEL_ROUTES = {
     "/v1/messages": ("POST", "v1/messages"),
+    "/v1/responses": ("POST", "responses"),
     "/v1/models": ("GET", "models"),
 }
 

@@ -14,24 +14,55 @@ from typing import Any
 from . import windows
 from .config import active_ports, find_mitmdump_executable, local_dir, read_pids
 
-DEFAULT_MODEL_ID = "claude-opus-5.5"
-# Probed against the upstream: /v1/models reports the context window and effort levels;
-# max_tokens above 128000 is rejected. Only adaptive thinking is accepted.
-CONTEXT_WINDOW = 1_000_000
+# Upstream endpoint -> (local gateway path, VS Code apiType), in order of preference.
+GATEWAY_APIS = {
+    "/v1/messages": ("/v1/messages", "messages"),
+    "/responses": ("/v1/responses", "responses"),
+}
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+EFFORTS_WITH_NONE = ("none", *EFFORTS)
+# Snapshot of /v1/models: (id, name, endpoint, context window, reasoning efforts).
+# Used when the gateway cannot list models (not running or no valid token).
+FALLBACK_MODELS = (
+    ("claude-opus-5.5", "Claude Opus 5.5", "/v1/messages", 1_000_000, EFFORTS),
+    ("claude-opus-5", "Claude Opus 5", "/v1/messages", 1_000_000, EFFORTS),
+    ("claude-sonnet-5.5", "Claude Sonnet 5.5", "/v1/messages", 1_000_000, EFFORTS),
+    ("claude-sonnet-5", "Claude Sonnet 5", "/v1/messages", 1_000_000, EFFORTS),
+    ("claude-haiku-5.5", "Claude Haiku 5.5", "/v1/messages", 1_000_000, EFFORTS),
+    ("gpt-5.6-sol", "GPT-5.6 Sol", "/responses", 1_050_000, EFFORTS_WITH_NONE),
+    ("gpt-5.6-luna", "GPT-5.6 Luna", "/responses", 1_050_000, EFFORTS_WITH_NONE),
+    ("gpt-6-luna", "GPT-6 Luna", "/responses", 1_050_000, EFFORTS_WITH_NONE),
+    ("gpt-61-sol", "GPT-6.1 Sol", "/responses", 1_050_000, EFFORTS),
+)
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+# Not reported by /v1/models. Probed: Claude rejects max_tokens above 128000; GPT does not
+# validate max_output_tokens, so the same limit is used for it.
 MAX_OUTPUT_TOKENS = 128_000
-REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+MODELS_TIMEOUT_SECONDS = 15
 
 
-def fetch_healthz(port: int) -> dict[str, Any] | None:
-    """Query the local gateway's /healthz without going through any system proxy."""
+def _get_local_json(port: int, path: str, timeout: float) -> Any:
+    """GET a local gateway endpoint without going through any system proxy."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(f"http://127.0.0.1:{port}/healthz", timeout=1.5) as resp:
+        with opener.open(f"http://127.0.0.1:{port}{path}", timeout=timeout) as resp:
             if resp.status == 200:
                 return json.loads(resp.read().decode("utf-8"))
     except (OSError, ValueError):
         return None
     return None
+
+
+def fetch_healthz(port: int) -> dict[str, Any] | None:
+    health = _get_local_json(port, "/healthz", 1.5)
+    return health if isinstance(health, dict) else None
+
+
+def fetch_models(port: int) -> list[Any] | None:
+    """Return the upstream model list via the local gateway, or None if unavailable."""
+    payload = _get_local_json(port, "/v1/models", MODELS_TIMEOUT_SECONDS)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, list) else None
 
 
 def is_port_listening(port: int, host: str = "127.0.0.1") -> bool:
@@ -54,28 +85,75 @@ def check_ca_trusted(local: Path) -> tuple[bool, str | None]:
         return False, thumb
 
 
-def build_vscode_config(port: int) -> list[dict[str, Any]]:
+def _dig(obj: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+def _gateway_endpoint(model: Any) -> str | None:
+    """Return the upstream endpoint the gateway can serve this model on, if any."""
+    endpoints = _dig(model, "supported_endpoints")
+    if not isinstance(_dig(model, "id"), str) or not isinstance(endpoints, list):
+        return None
+    return next((api for api in GATEWAY_APIS if api in endpoints), None)
+
+
+def _gateway_models(upstream_models: list[Any] | None) -> list[dict[str, Any]]:
+    return [model for model in upstream_models or [] if _gateway_endpoint(model)]
+
+
+def _fallback_models() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": model_id,
+            "name": name,
+            "supported_endpoints": [endpoint],
+            "capabilities": {
+                "limits": {"max_context_window_tokens": context},
+                "supports": {"reasoning_effort": list(efforts)},
+            },
+        }
+        for model_id, name, endpoint, context, efforts in FALLBACK_MODELS
+    ]
+
+
+def _vscode_model(port: int, model: dict[str, Any]) -> dict[str, Any]:
+    path, api_type = GATEWAY_APIS[_gateway_endpoint(model)]
+    name = model.get("name") if isinstance(model.get("name"), str) else model["id"]
+    context = _dig(model, "capabilities", "limits", "max_context_window_tokens")
+    efforts = _dig(model, "capabilities", "supports", "reasoning_effort")
+    entry: dict[str, Any] = {
+        "id": model["id"],
+        "name": f"{name} (本机代理)",
+        "url": f"http://127.0.0.1:{port}{path}",
+        "apiType": api_type,
+        "toolCalling": True,
+        "vision": False,
+        "contextWindow": context if type(context) is int and context > 0 else DEFAULT_CONTEXT_WINDOW,
+        "maxOutputTokens": MAX_OUTPUT_TOKENS,
+    }
+    if api_type == "messages":
+        # The upstream only accepts thinking.type "adaptive"; budget-based thinking is rejected.
+        entry.update(thinking=True, adaptiveThinking=True)
+    if isinstance(efforts, list) and efforts and all(isinstance(e, str) for e in efforts):
+        entry["supportsReasoningEffort"] = efforts
+    return entry
+
+
+def build_vscode_config(
+    port: int, upstream_models: list[Any] | None = None
+) -> list[dict[str, Any]]:
+    models = _gateway_models(upstream_models) or _fallback_models()
     return [
         {
             "name": "本机 Copilot App 代理",
             "vendor": "customendpoint",
             # The gateway ignores caller credentials; VS Code only requires a non-empty value.
             "apiKey": "local",
-            "models": [
-                {
-                    "id": DEFAULT_MODEL_ID,
-                    "name": f"{DEFAULT_MODEL_ID} (本机代理)",
-                    "url": f"http://127.0.0.1:{port}/v1/messages",
-                    "apiType": "messages",
-                    "toolCalling": True,
-                    "vision": False,
-                    "thinking": True,
-                    "adaptiveThinking": True,
-                    "supportsReasoningEffort": list(REASONING_EFFORTS),
-                    "contextWindow": CONTEXT_WINDOW,
-                    "maxOutputTokens": MAX_OUTPUT_TOKENS,
-                }
-            ],
+            "models": [_vscode_model(port, model) for model in models],
         }
     ]
 
@@ -178,5 +256,12 @@ def run_doctor(root: Path, gateway_port: int, proxy_port: int) -> int:
 
 
 def run_vscode_config(gateway_port: int) -> int:
-    print(json.dumps(build_vscode_config(gateway_port), ensure_ascii=False, indent=2))
+    upstream_models = fetch_models(gateway_port)
+    if not _gateway_models(upstream_models):
+        print(
+            "未能通过网关获取模型列表（网关未启动或令牌已过期），已输出内置的模型列表。",
+            file=sys.stderr,
+        )
+    config = build_vscode_config(gateway_port, upstream_models)
+    print(json.dumps(config, ensure_ascii=False, indent=2))
     return 0
