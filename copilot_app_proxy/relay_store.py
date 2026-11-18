@@ -51,7 +51,7 @@ def _format_iso(dt: datetime | None) -> str | None:
 
 
 class RelayTokenStore:
-    """Thread/async-safe in-memory and DPAPI-backed upstream token store."""
+    """In-memory and DPAPI-backed token store for a single asyncio event loop."""
 
     def __init__(self, token_file: str | Path | None = None) -> None:
         self._token: str | None = None
@@ -78,13 +78,15 @@ class RelayTokenStore:
         """Validate, store in memory, and persist token to DPAPI file."""
         if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
             raise RequestError(400, "invalid_request_error", "Invalid token format.")
-        expires_on = decode_jwt_exp(token)
         async with self._lock:
-            if self._token_file is not None:
-                await asyncio.to_thread(save_protected_text, self._token_file, token)
-            self._token = token
-            self._expires_on = expires_on
-        return {"expiresOn": _format_iso(expires_on)}
+            if token != self._token:
+                expires_on = decode_jwt_exp(token)
+                # Commit memory only after persistence succeeds, so a failed write can be retried.
+                if self._token_file is not None:
+                    await asyncio.to_thread(save_protected_text, self._token_file, token)
+                self._token = token
+                self._expires_on = expires_on
+            return {"expiresOn": _format_iso(self._expires_on)}
 
     def get_token(self) -> str:
         """Return active upstream token or raise RequestError(401) if missing/expired."""

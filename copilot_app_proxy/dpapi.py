@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ctypes
 import os
 import sys
@@ -54,57 +55,42 @@ if sys.platform == "win32":
     _kernel32.LocalFree.restype = ctypes.c_void_p
 
 
-def _ensure_windows() -> None:
+def _crypt_bytes(data: bytes, *, decrypt: bool) -> bytes:
     if sys.platform != "win32":
         raise DpapiError("DPAPI is only supported on Windows.")
+
+    operation = "unprotect" if decrypt else "protect"
+    if not data:
+        raise DpapiError(f"DPAPI {operation} failed: input is empty.")
+    transform = _crypt32.CryptUnprotectData if decrypt else _crypt32.CryptProtectData
+    buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+    blob_in = _DataBlob(len(data), buf)
+    blob_out = _DataBlob()
+    if not transform(
+        ctypes.byref(blob_in),
+        None,
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(blob_out),
+    ):
+        raise DpapiError(f"DPAPI {operation} failed.")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        # DPAPI allocates the output buffer; Python does not own this memory.
+        _kernel32.LocalFree(blob_out.pbData)
 
 
 def protect_bytes(plain: bytes) -> bytes:
     """Encrypt bytes using CurrentUser DPAPI."""
-    _ensure_windows()
-    if not plain:
-        raise DpapiError("DPAPI protect failed: input is empty.")
-    buf = (ctypes.c_ubyte * len(plain)).from_buffer_copy(plain)
-    blob_in = _DataBlob(len(plain), buf)
-    blob_out = _DataBlob()
-    if not _crypt32.CryptProtectData(
-        ctypes.byref(blob_in),
-        None,
-        None,
-        None,
-        None,
-        CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(blob_out),
-    ):
-        raise DpapiError("DPAPI protect failed.")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        _kernel32.LocalFree(blob_out.pbData)
+    return _crypt_bytes(plain, decrypt=False)
 
 
 def unprotect_bytes(cipher: bytes) -> bytes:
     """Decrypt CurrentUser DPAPI-protected bytes."""
-    _ensure_windows()
-    if not cipher:
-        raise DpapiError("DPAPI unprotect failed: input is empty.")
-    buf = (ctypes.c_ubyte * len(cipher)).from_buffer_copy(cipher)
-    blob_in = _DataBlob(len(cipher), buf)
-    blob_out = _DataBlob()
-    if not _crypt32.CryptUnprotectData(
-        ctypes.byref(blob_in),
-        None,
-        None,
-        None,
-        None,
-        CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(blob_out),
-    ):
-        raise DpapiError("DPAPI unprotect failed.")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        _kernel32.LocalFree(blob_out.pbData)
+    return _crypt_bytes(cipher, decrypt=True)
 
 
 def protect_text(plain_text: str) -> str:
@@ -122,7 +108,7 @@ def unprotect_text(encoded_text: str) -> str:
         raise DpapiError("DPAPI unprotect failed: input is empty.")
     try:
         cipher = base64.b64decode(stripped, validate=True)
-    except Exception as exc:
+    except (binascii.Error, ValueError) as exc:
         raise DpapiError("DPAPI unprotect failed: invalid base64 payload.") from exc
     return unprotect_bytes(cipher).decode("utf-8")
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from unittest.mock import patch
 
@@ -46,35 +45,18 @@ def test_is_pid_alive_checks_current_and_invalid_pids():
     assert is_pid_alive(0) is False
 
 
-def test_run_status_reports_stopped_when_not_running(tmp_path, capsys):
-    with patch("copilot_app_proxy.cli_tools.fetch_healthz", return_value=None):
-        code = run_status(port=19999, base_dir=tmp_path)
-    assert code == 1
-    out = capsys.readouterr().out
-    assert "STOPPED" in out
-
-
-def test_run_status_reports_ready_when_healthy(tmp_path, capsys):
+@pytest.mark.parametrize(("running", "exit_code"), [(False, 1), (True, 0)])
+def test_run_status_reports_gateway_state(tmp_path, capsys, running, exit_code):
     local_dir = tmp_path / ".local"
     local_dir.mkdir(parents=True)
-    (local_dir / "pids.json").write_text(
-        json.dumps({"gatewayPort": 19324, "proxyPort": 19323}), encoding="utf-8"
-    )
-    health = {
-        "status": "ok",
-        "upstreamAuthenticated": True,
-        "tokenExpiresOn": "2030-01-01T00:00:00Z",
-        "expiresInSeconds": 3600,
-    }
-    with (
-        patch("copilot_app_proxy.cli_tools.fetch_healthz", return_value=health),
-        patch("copilot_app_proxy.cli_tools.check_ca_trusted", return_value=(True, "AABBCC")),
-    ):
-        code = run_status(base_dir=tmp_path)
-    assert code == 0
+    (local_dir / "pids.json").write_text('{"gatewayPort": 19999}', encoding="utf-8")
+    health = {"upstreamAuthenticated": True} if running else None
+    with patch("copilot_app_proxy.cli_tools.fetch_healthz", return_value=health):
+        assert run_status(base_dir=tmp_path) == exit_code
     out = capsys.readouterr().out
-    assert "RUNNING" in out
-    assert "READY" in out
+    state = "RUNNING" if running else "STOPPED"
+    assert f"Gateway (127.0.0.1:19999): {state}" in out
+    assert ("Upstream Token: READY" in out) is running
 
 
 def test_run_doctor_flags_same_ports(tmp_path, capsys):

@@ -2,44 +2,35 @@
 
 from __future__ import annotations
 
-import io
-import os
-import unittest
 import urllib.error
-from contextlib import redirect_stdout
-from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock
 
-from mitmproxy import http
+from mitmproxy import connection, http
 
 from copilot_app_proxy.relay_addon import TokenRelayAddon
 
 
-class TokenRelayTests(unittest.TestCase):
-    def test_failed_push_retries_and_success_is_deduplicated(self) -> None:
-        token = "synthetic-test-token-not-a-real-credential"
-        with patch.dict(os.environ, {"RELAY_INGEST_SECRET": "synthetic-secret"}):
-            addon = TokenRelayAddon()
-        response = MagicMock()
-        response.__enter__.return_value.status = 200
-        addon.opener = Mock()
-        addon.opener.open.side_effect = [urllib.error.URLError("temporary outage"), response]
-        flow = SimpleNamespace(
-            request=http.Request.make(
-                "POST",
-                "https://loki.delve.office.com/api/v1/llmapi/v1/messages",
-                headers={"authorization": f"Bearer {token}"},
-            )
-        )
-        with redirect_stdout(io.StringIO()) as output:
-            addon.request(flow)
-            self.assertEqual(addon.last_token, "")
-            addon.request(flow)
-            addon.request(flow)
-        self.assertEqual(addon.opener.open.call_count, 2)
-        self.assertEqual(addon.last_token, token)
-        self.assertNotIn(token, output.getvalue())
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_failed_push_retries_and_success_is_deduplicated(monkeypatch, capsys):
+    token = "synthetic-test-token-not-a-real-credential"
+    monkeypatch.setenv("RELAY_INGEST_SECRET", "synthetic-secret")
+    addon = TokenRelayAddon()
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    opener = addon.opener = Mock()
+    opener.open.side_effect = [urllib.error.URLError("temporary outage"), response]
+    flow = http.HTTPFlow(
+        connection.Client(peername=("127.0.0.1", 1), sockname=("127.0.0.1", 2)),
+        connection.Server(address=None),
+    )
+    flow.request = http.Request.make(
+        "POST",
+        "https://loki.delve.office.com/api/v1/llmapi/v1/messages",
+        headers={"authorization": f"Bearer {token}"},
+    )
+    addon.request(flow)
+    assert addon.last_token == ""
+    addon.request(flow)
+    addon.request(flow)
+    assert opener.open.call_count == 2
+    assert addon.last_token == token
+    assert token not in capsys.readouterr().out

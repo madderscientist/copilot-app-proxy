@@ -8,12 +8,13 @@ import json
 import re
 import time
 from contextlib import asynccontextmanager
+from unittest.mock import patch
 
 import aiohttp
 import pytest
 from aiohttp import web
 
-from copilot_app_proxy.gateway import create_app
+from copilot_app_proxy.gateway import CLIENT_SESSION_KEY, create_app
 from copilot_app_proxy.relay_store import RelayTokenStore
 
 SYNTHETIC_TOKEN = "synthetic-test-token-not-a-real-credential"
@@ -27,7 +28,7 @@ async def _start_app(app: web.Application) -> tuple[web.AppRunner, str]:
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
     await site.start()
-    port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr]
+    port = runner.addresses[0][1]
     return runner, f"http://127.0.0.1:{port}"
 
 
@@ -44,30 +45,12 @@ async def gateway_fixture(upstream_handler, **gateway_kwargs):
     finally:
         await gw_runner.cleanup()
         await up_runner.cleanup()
+    assert gw_app[CLIENT_SESSION_KEY].closed
 
 
 def _make_jwt(exp: int) -> str:
-    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode("utf-8")).decode("ascii").rstrip("=")
-    return f"e30.{payload}.sig"
-
-
-@pytest.mark.asyncio
-async def test_health_does_not_imply_upstream_auth_and_missing_token_never_reaches_upstream():
-    upstream_calls = 0
-
-    async def handler(_request: web.Request) -> web.Response:
-        nonlocal upstream_calls
-        upstream_calls += 1
-        return web.Response(text="ok")
-
-    async with gateway_fixture(handler) as (url, client):
-        async with client.get(f"{url}/healthz") as resp:
-            assert resp.status == 200
-            data = await resp.json()
-            assert data["upstreamAuthenticated"] is False
-        async with client.post(f"{url}/v1/messages", data="{}") as resp:
-            assert resp.status == 401
-        assert upstream_calls == 0
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode())
+    return f"e30.{payload.decode().rstrip('=')}.sig"
 
 
 @pytest.mark.asyncio
@@ -94,11 +77,11 @@ async def test_messages_json_and_tools_forwarded_unchanged_with_scoped_headers()
         }
     )
 
-    async with gateway_fixture(handler) as (url, client), client.post(
-        f"{url}/v1/messages",
-        data=body,
-        headers={**AUTH, "cookie": "must-not-forward=1", "x-unrelated-secret": "must-not-forward"},
-    ) as resp:
+    headers = {**AUTH, "cookie": "must-not-forward=1", "x-unrelated-secret": "must-not-forward"}
+    async with (
+        gateway_fixture(handler) as (url, client),
+        client.post(f"{url}/v1/messages", data=body, headers=headers) as resp,
+    ):
         assert resp.status == 200
         data = await resp.json()
         assert data["content"][0]["text"] == "OK"
@@ -188,25 +171,32 @@ async def test_upstream_auth_failures_preserved():
 
 
 @pytest.mark.asyncio
-async def test_bad_json_excessive_bodies_ambiguous_creds_origins_and_routes_rejected():
+async def test_invalid_requests_never_reach_upstream():
     upstream_calls = 0
 
-    async def handler(_request: web.Request) -> web.Response:
+    async def handler(_: web.Request) -> web.Response:
         nonlocal upstream_calls
         upstream_calls += 1
         return web.Response(text="ok")
 
     cases = [
+        ("POST", "/v1/messages", {}, "{}", 401),
         ("POST", "/v1/messages", AUTH, "not-json", 400),
+        ("POST", "/v1/messages", AUTH, "[]", 400),
+        ("POST", "/v1/messages", AUTH, b"\xff", 400),
         ("POST", "/v1/messages", AUTH, json.dumps({"text": "x" * 300}), 413),
         ("POST", "/v1/messages", {**AUTH, "x-api-key": SYNTHETIC_TOKEN}, "{}", 401),
         ("GET", "/healthz", {"origin": "https://untrusted.invalid"}, None, 403),
+        ("GET", "/healthz", {"host": "untrusted.invalid"}, None, 403),
         ("POST", "/v1/messages?access_token=must-not-leak", AUTH, "{}", 400),
         ("GET", "/proxy/https://untrusted.invalid", AUTH, None, 404),
         ("GET", "/v1/messages", AUTH, None, 405),
     ]
 
     async with gateway_fixture(handler, body_limit=256) as (url, client):
+        async with client.get(f"{url}/healthz") as resp:
+            assert resp.status == 200
+            assert (await resp.json())["upstreamAuthenticated"] is False
         for method, path, headers, body, expected_status in cases:
             async with client.request(method, f"{url}{path}", headers=headers, data=body) as resp:
                 assert resp.status == expected_status
@@ -217,32 +207,30 @@ async def test_bad_json_excessive_bodies_ambiguous_creds_origins_and_routes_reje
 
 
 @pytest.mark.asyncio
-async def test_non_loopback_host_header_rejected():
-    async def handler(_request: web.Request) -> web.Response:
-        return web.Response(text="ok")
-
-    async with (
-        gateway_fixture(handler) as (url, client),
-        client.get(f"{url}/healthz", headers={"Host": "untrusted.invalid"}) as resp,
-    ):
-        assert resp.status == 403
-
-
-@pytest.mark.asyncio
-async def test_unresponsive_upstream_times_out_without_leaking_credentials():
+@pytest.mark.parametrize("status", [502, 504])
+async def test_upstream_errors_do_not_leak_credentials(status):
     async def handler(request: web.Request) -> web.Response:
         await request.read()
-        await asyncio.sleep(1.0)
-        return web.Response(text="late")
+        if status == 502:
+            transport = request.transport
+            assert transport is not None
+            transport.abort()
+        else:
+            await asyncio.sleep(1.0)
+        return web.Response()
 
+    timeout_ms = 100 if status == 504 else 2_000
     async with (
-        gateway_fixture(handler, timeout_ms=100) as (url, client),
+        gateway_fixture(handler, timeout_ms=timeout_ms) as (url, client),
         client.post(f"{url}/v1/messages", headers=AUTH, data="{}") as resp,
     ):
-        assert resp.status == 504
-        text = await resp.text()
-        assert "timed out" in text
-        assert SYNTHETIC_TOKEN not in text
+        assert resp.status == status
+        assert resp.headers["cache-control"] == "no-store"
+        message = "Upstream timed out." if status == 504 else "Upstream connection failed."
+        assert await resp.json() == {
+            "type": "error",
+            "error": {"type": "api_error", "message": message},
+        }
 
 
 @pytest.mark.asyncio
@@ -285,7 +273,7 @@ async def test_token_provider_validates_local_key_and_injects_upstream_token():
 async def test_token_provider_fails_closed_on_errors():
     upstream_calls = 0
 
-    async def handler(_request: web.Request) -> web.Response:
+    async def handler(_: web.Request) -> web.Response:
         nonlocal upstream_calls
         upstream_calls += 1
         return web.Response(text="ok")
@@ -359,6 +347,17 @@ async def test_relay_mode_ingests_token_stores_dpapi_cache_and_forwards(tmp_path
         assert await reloaded.load_cached() is True
         assert reloaded.get_token() == jwt_token
 
+        with patch("copilot_app_proxy.relay_store.save_protected_text") as save:
+            await reloaded.set_token(jwt_token)
+            save.assert_not_called()
+            save.side_effect = OSError("synthetic write failure")
+            with pytest.raises(OSError, match="synthetic write failure"):
+                await reloaded.set_token(SYNTHETIC_TOKEN)
+            assert reloaded.get_token() == jwt_token
+            save.side_effect = None
+            await reloaded.set_token(SYNTHETIC_TOKEN)
+            assert reloaded.get_token() == SYNTHETIC_TOKEN
+
         async with client.get(f"{url}/healthz") as health:
             health_json = await health.json()
             assert health_json["authentication"] == "copilot-token-relay"
@@ -378,7 +377,7 @@ async def test_relay_missing_and_expired_token_errors_preserve_copilot_instructi
     relay_store = RelayTokenStore()
     upstream_calls = 0
 
-    async def handler(_request: web.Request) -> web.Response:
+    async def handler(_: web.Request) -> web.Response:
         nonlocal upstream_calls
         upstream_calls += 1
         return web.Response(text="ok")

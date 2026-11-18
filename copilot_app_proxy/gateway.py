@@ -10,7 +10,7 @@ import os
 import re
 import sys
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,9 +50,7 @@ class RouteSpec:
 
 ROUTES: dict[str, RouteSpec] = {
     "/v1/messages": RouteSpec(method="POST", upstream_path="v1/messages"),
-    "/v1/messages/count_tokens": RouteSpec(
-        method="POST", upstream_path="v1/messages/count_tokens"
-    ),
+    "/v1/messages/count_tokens": RouteSpec(method="POST", upstream_path="v1/messages/count_tokens"),
     "/v1/models": RouteSpec(method="GET", upstream_path="models"),
 }
 
@@ -60,25 +58,15 @@ TokenProvider = Callable[[], str | Awaitable[str]]
 
 
 def _json_response(
-    status: int,
-    payload: Mapping[str, Any],
-    *,
-    headers: Mapping[str, str] | None = None,
+    status: int, payload: Mapping[str, Any], *, headers: Mapping[str, str] | None = None
 ) -> web.Response:
-    merged_headers = {
+    response_headers = {
         "cache-control": "no-store",
         "x-content-type-options": "nosniff",
         "connection": "close",
+        **(headers or {}),
     }
-    if headers:
-        merged_headers.update(headers)
-    return web.Response(
-        status=status,
-        text=json.dumps(payload),
-        content_type="application/json",
-        charset="utf-8",
-        headers=merged_headers,
-    )
+    return web.json_response(payload, status=status, headers=response_headers)
 
 
 def _require_secret(candidate: str | None, expected: str, message: str) -> None:
@@ -121,14 +109,18 @@ def _validate_local_request(request: web.Request) -> None:
     try:
         authority = urlsplit(f"http://{host}")
     except ValueError as exc:
-        raise RequestError(403, "permission_error", "Only this loopback endpoint is allowed.") from exc
+        raise RequestError(
+            403, "permission_error", "Only this loopback endpoint is allowed."
+        ) from exc
 
     sockname = request.transport.get_extra_info("sockname") if request.transport else None
     local_port = sockname[1] if isinstance(sockname, tuple) and len(sockname) >= 2 else None
     try:
         host_port = authority.port or 80
     except ValueError as exc:
-        raise RequestError(403, "permission_error", "Only this loopback endpoint is allowed.") from exc
+        raise RequestError(
+            403, "permission_error", "Only this loopback endpoint is allowed."
+        ) from exc
 
     if (
         authority.hostname not in ("localhost", "127.0.0.1")
@@ -151,7 +143,9 @@ def _validate_local_request(request: web.Request) -> None:
         raise RequestError(400, "invalid_request_error", "Query parameters are not accepted.")
 
 
-async def _read_json_body(request: web.Request, limit: int, timeout_sec: float) -> bytes:
+async def _read_json_body(
+    request: web.Request, limit: int, timeout_sec: float
+) -> tuple[bytes, dict[str, Any]]:
     declared = request.headers.get("content-length")
     if declared is not None:
         try:
@@ -191,7 +185,8 @@ async def _read_json_body(request: web.Request, limit: int, timeout_sec: float) 
         raise RequestError(
             400, "invalid_request_error", "Request body must be a JSON object."
         ) from exc
-    return body
+    # Keep the original bytes for forwarding; internal routes reuse the parsed object.
+    return body, parsed
 
 
 async def _forward(
@@ -221,7 +216,6 @@ async def _forward(
 
     session = request.app[CLIENT_SESSION_KEY]
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    prepared = False
     stream_resp: web.StreamResponse | None = None
 
     try:
@@ -241,32 +235,18 @@ async def _forward(
                 for value in upstream_resp.headers.getall(name, ()):
                     stream_resp.headers.add(name, value)
             await stream_resp.prepare(request)
-            prepared = True
-
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
                     await stream_resp.write(chunk)
             await stream_resp.write_eof()
             return stream_resp
-    except TimeoutError:
-        if prepared and stream_resp is not None:
+    except (aiohttp.ClientError, OSError) as exc:
+        # A committed stream cannot be replaced by a JSON error.
+        if stream_resp is not None and stream_resp.prepared:
             return stream_resp
-        return _json_response(
-            504,
-            {"type": "error", "error": {"type": "api_error", "message": "Upstream timed out."}},
-        )
-    except (aiohttp.ClientError, OSError):
-        if prepared and stream_resp is not None:
-            return stream_resp
-        return _json_response(
-            502,
-            {
-                "type": "error",
-                "error": {"type": "api_error", "message": "Upstream connection failed."},
-            },
-        )
-    except asyncio.CancelledError:
-        raise
+        if isinstance(exc, TimeoutError):
+            raise RequestError(504, "api_error", "Upstream timed out.") from exc
+        raise RequestError(502, "api_error", "Upstream connection failed.") from exc
 
 
 def create_app(
@@ -282,7 +262,9 @@ def create_app(
 ) -> web.Application:
     """Create the aiohttp gateway application."""
     if token_provider is not None and (
-        not callable(token_provider) or not isinstance(local_api_key, str) or len(local_api_key) < 32
+        not callable(token_provider)
+        or not isinstance(local_api_key, str)
+        or len(local_api_key) < 32
     ):
         raise ValueError(
             "Managed login requires a token provider and a local API key of at least 32 characters."
@@ -308,14 +290,12 @@ def create_app(
         "local-gateway-key" if token_provider else "caller-provided-upstream-token"
     )
 
-    async def on_startup(app: web.Application) -> None:
-        connector = aiohttp.TCPConnector(limit=64)
-        app[CLIENT_SESSION_KEY] = aiohttp.ClientSession(connector=connector, auto_decompress=False)
-
-    async def on_cleanup(app: web.Application) -> None:
-        session = app.get(CLIENT_SESSION_KEY)
-        if session is not None and not session.closed:
-            await session.close()
+    async def http_client(app: web.Application) -> AsyncIterator[None]:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=64), auto_decompress=False
+        ) as session:
+            app[CLIENT_SESSION_KEY] = session
+            yield
 
     async def handle_all(request: web.Request) -> web.StreamResponse:
         extra_headers: dict[str, str] = {}
@@ -344,10 +324,11 @@ def create_app(
                     raise RequestError(401, "authentication_error", "Missing relay ingest secret.")
                 assert relay_ingest_secret is not None
                 _require_secret(secret, relay_ingest_secret, "Invalid relay ingest secret.")
-                raw_body = await _read_json_body(request, 64 * 1024, timeout_sec)
-                parsed = json.loads(raw_body.decode("utf-8"))
+                _, parsed = await _read_json_body(request, 64 * 1024, timeout_sec)
                 info = await relay_store.set_token(parsed.get("token"))
-                return _json_response(200, {"status": "updated", "tokenExpiresOn": info["expiresOn"]})
+                return _json_response(
+                    200, {"status": "updated", "tokenExpiresOn": info["expiresOn"]}
+                )
 
             route = ROUTES.get(path)
             if route is None:
@@ -379,11 +360,9 @@ def create_app(
                         401, "authentication_error", "No valid upstream access token is available."
                     )
 
-            body = (
-                await _read_json_body(request, body_limit, timeout_sec)
-                if route.method == "POST"
-                else None
-            )
+            body = None
+            if route.method == "POST":
+                body, _ = await _read_json_body(request, body_limit, timeout_sec)
             target_url = urljoin(upstream_base, route.upstream_path)
             return await _forward(request, target_url, token, body, timeout_sec)
         except RequestError as exc:
@@ -395,12 +374,14 @@ def create_app(
         except Exception:  # noqa: BLE001
             return _json_response(
                 400,
-                {"type": "error", "error": {"type": "invalid_request_error", "message": "Invalid request."}},
+                {
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": "Invalid request."},
+                },
             )
 
     app = web.Application(client_max_size=0)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    app.cleanup_ctx.append(http_client)
     app.router.add_route("*", "/{tail:.*}", handle_all)
     return app
 

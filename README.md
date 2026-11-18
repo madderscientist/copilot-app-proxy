@@ -20,7 +20,7 @@ API 调查过程和已验证的适用范围见 [API-DISCOVERY.md](API-DISCOVERY.
 - 已安装、已登录并可正常使用 Code 功能的 Microsoft Copilot 桌面应用。GitHub Copilot 插件或网页版不能替代此桌面应用。
 - 能够访问 PyPI 和账号实际使用的模型服务；企业网络可指定获准的包源。
 
-项目使用 Windows DPAPI，当前不支持 macOS 或 Linux。运行不需要管理员权限，但会在当前用户证书库中添加临时 CA，需要本人同意；若组织禁止 HTTPS 解密或脚本执行，不应绕过该策略。
+项目使用 Windows DPAPI，当前不支持 macOS 或 Linux。运行不需要管理员权限，但会在当前用户证书库中添加临时 CA，需要本人同意。
 
 ## 首次安装
 
@@ -190,9 +190,10 @@ Invoke-RestMethod http://127.0.0.1:19324/healthz
 
 ## 开发测试
 
-在已安装依赖的项目目录中运行：
+先安装开发依赖（包含异步测试插件），然后运行：
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pytest -v
 .\.venv\Scripts\python.exe -m ruff check copilot_app_proxy tests
 ```

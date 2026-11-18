@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
+import io
 import sys
 
 from copilot_app_proxy.cli_tools import (
@@ -14,7 +14,6 @@ from copilot_app_proxy.cli_tools import (
     run_status,
     run_vscode_config,
 )
-from copilot_app_proxy.gateway import serve_gateway
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
+        if isinstance(stream, io.TextIOWrapper):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError):
@@ -83,6 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         return run_key(copy=not args.no_copy)
     if args.command == "vscode-config":
         return run_vscode_config(port=args.port)
+
+    # Status/config/help commands do not need the HTTP server and its dependencies.
+    import asyncio
+
+    from copilot_app_proxy.gateway import serve_gateway
 
     mode = "relay" if args.relay else "passthrough"
     try:
