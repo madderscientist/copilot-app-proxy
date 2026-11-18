@@ -92,14 +92,15 @@ class RelayTokenStore:
             raise RequestError(
                 401,
                 "authentication_error",
-                "No Copilot upstream token captured yet. Trigger a request in Copilot App.",
+                "No Copilot upstream token captured yet. "
+                "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。",
             )
         if self._expires_on is not None and self._expires_on <= datetime.now(UTC):
             raise RequestError(
                 401,
                 "authentication_error",
                 "Captured Copilot token has expired. "
-                "Trigger a new request in Copilot App to refresh it.",
+                "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。",
             )
         return self._token
 

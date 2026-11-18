@@ -372,7 +372,7 @@ def create_app(
                         401,
                         "authentication_error",
                         "Upstream token is unavailable or expired. "
-                        "Trigger a request in Copilot App to refresh it.",
+                        "请在 Copilot App 的 Code 页发送一次消息，让中继获取当前模型 API 的访问令牌。",
                     ) from exc
                 if not isinstance(token, str) or not TOKEN_PATTERN.fullmatch(token):
                     raise RequestError(

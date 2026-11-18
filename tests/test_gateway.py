@@ -397,6 +397,7 @@ async def test_relay_missing_and_expired_token_errors_preserve_copilot_instructi
                 msg = result["error"]["message"]
                 assert ("has expired" if expired else "No Copilot upstream token") in msg
                 assert "Copilot App" in msg
+                assert "Code 页发送一次消息" in msg
                 assert "--login" not in msg
                 assert relay_store.status()["hasToken"] is False
         assert upstream_calls == 0
