@@ -24,7 +24,7 @@ dev = [
 copilot-proxy = "copilot_app_proxy.__main__:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["copilot_app_proxy*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

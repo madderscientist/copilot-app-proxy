@@ -32,7 +32,7 @@ Set-Location copilot-app-proxy
 .\install.ps1
 ```
 
-安装脚本创建项目内的 `.venv/`，从 `requirements.txt` 安装固定版本 mitmproxy、aiohttp 和 msal，并可编辑安装 `copilot-app-proxy`。它不修改全局 Python 配置，不安装证书、不启动代理或重启 Copilot。
+安装脚本创建项目内的 `.venv/`，从 `pyproject.toml` 安装固定版本 mitmproxy、aiohttp 和 msal，并可编辑安装 `copilot-app-proxy`。它不修改全局 Python 配置，不安装证书、不启动代理或重启 Copilot。
 
 如果自动检测不到 Python，可指定真实解释器，不能使用 Windows 商店的空占位入口：
 
@@ -209,7 +209,7 @@ $env:LOCAL_GATEWAY_KEY = [Guid]::NewGuid().ToString('N')
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -v
-.\.venv\Scripts\python.exe -m ruff check src tests relay_addon.py
+.\.venv\Scripts\python.exe -m ruff check copilot_app_proxy tests
 ```
 
 测试只使用模拟请求和临时测试缓存，不需要真实账号、令牌或模型额度。
@@ -220,15 +220,13 @@ $env:LOCAL_GATEWAY_KEY = [Guid]::NewGuid().ToString('N')
 copilot-app-proxy/
   README.md                       中文使用说明
   pyproject.toml                  Python 项目配置、依赖与 CLI 入口
-  requirements.txt                Python 运行时依赖
   install.ps1                     项目内依赖安装入口
   start-transparent-proxy.ps1     启动中继并配置 Copilot
   stop-transparent-proxy.ps1      停止中继并恢复 Copilot
   status.ps1                      一键查看代理与令牌状态
   doctor.ps1                      一键诊断环境与端口问题
-  relay_addon.py                  mitmproxy 脚本入口（转发至包内插件）
   entra-permissions.json          可选登录的最小权限清单
-  src/copilot_app_proxy/
+  copilot_app_proxy/
     __main__.py                   CLI 入口（serve / status / doctor / key / vscode-config）
     gateway.py                    aiohttp 网关、SSE 流式转发与路由
     relay_store.py                内存与 DPAPI 令牌缓存及到期判断

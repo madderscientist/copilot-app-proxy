@@ -33,15 +33,10 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
     & $python -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw 'Could not create the project Python environment.' }
 }
-$pipArguments = @('-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'off', '-r', (Join-Path $repoRoot 'requirements.txt'))
+$pipArguments = @('-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'off', '-e', $repoRoot)
 if ($PythonIndexUrl) { $pipArguments += @('--index-url', $PythonIndexUrl) }
 & $venvPython @pipArguments
 if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python dependencies.' }
-
-$editableArgs = @('-m', 'pip', 'install', '--disable-pip-version-check', '--progress-bar', 'off', '--no-deps', '-e', $repoRoot)
-if ($PythonIndexUrl) { $editableArgs += @('--index-url', $PythonIndexUrl) }
-& $venvPython @editableArgs
-if ($LASTEXITCODE -ne 0) { throw 'Could not install copilot-app-proxy package.' }
 
 Write-Host 'Installation complete. No certificates, proxy settings, or accounts were changed.' -ForegroundColor Green
 Write-Host 'Start with: .\start-transparent-proxy.ps1 -CopyKey'

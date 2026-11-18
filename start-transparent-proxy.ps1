@@ -124,7 +124,7 @@ try {
     New-Item -ItemType Directory -Path $caDir -Force | Out-Null
     $mitmPsi = New-Object System.Diagnostics.ProcessStartInfo
     $mitmPsi.FileName = $mitmExe
-    $mitmPsi.Arguments = "--listen-host 127.0.0.1 --listen-port $ProxyPort --set confdir=`"$caDir`" --set flow_detail=0 --set termlog_verbosity=error --scripts `"$(Join-Path $repoRoot 'relay_addon.py')`""
+    $mitmPsi.Arguments = "--listen-host 127.0.0.1 --listen-port $ProxyPort --set confdir=`"$caDir`" --set flow_detail=0 --set termlog_verbosity=error --scripts `"$(Join-Path $repoRoot 'copilot_app_proxy\relay_addon.py')`""
     $mitmPsi.WorkingDirectory = $repoRoot
     $mitmPsi.UseShellExecute = $false
     $mitmPsi.CreateNoWindow = $true
