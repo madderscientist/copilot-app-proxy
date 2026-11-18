@@ -28,10 +28,6 @@ def test_dpapi_roundtrip_and_file_persistence(tmp_path):
     assert secret not in raw
     assert load_protected_text(dpapi_file) == secret
 
-    # Tolerate a UTF-8 BOM in files written by older PowerShell tooling.
-    dpapi_file.write_bytes(b"\xef\xbb\xbf" + raw.encode("utf-8"))
-    assert load_protected_text(dpapi_file) == secret
-
 
 def test_dpapi_rejects_empty_or_invalid_payload():
     with pytest.raises(DpapiError):

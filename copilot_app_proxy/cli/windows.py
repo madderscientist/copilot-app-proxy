@@ -148,5 +148,9 @@ def trust_ca(cert: Path, thumbprint: str) -> None:
 
 
 def remove_ca(thumbprint: str) -> None:
-    path = _ca_path(thumbprint)
-    _powershell(f"if (Test-Path -LiteralPath '{path}') {{ Remove-Item -LiteralPath '{path}' }}")
+    # PowerShell's certificate provider refuses user-root deletions when UI is
+    # not allowed; certutil shows the Windows confirmation prompt instead.
+    if ca_is_trusted(thumbprint):
+        subprocess.run(["certutil.exe", "-user", "-delstore", "Root", thumbprint], check=True)
+        if ca_is_trusted(thumbprint):
+            raise RuntimeError("Temporary CA is still trusted in the current user's store.")

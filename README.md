@@ -56,7 +56,9 @@ Set-Location copilot-app-proxy
 .\.venv\Scripts\copilot-proxy.exe stop
 ```
 
-停止后会保留 DPAPI 加密的上游令牌缓存 `.local/token.dpapi`，以便下次启动使用；不再需要时可在停止后删除。旧版本生成的 `.local/gateway-key.dpapi` 已不再使用，可直接删除。
+移除根证书时 Windows 会弹出删除确认，需要本人确认；若取消，`stop` 会报错并保留记录，可再次执行。
+
+停止后会保留 DPAPI 加密的上游令牌缓存 `.local/token.dpapi`，以便下次启动使用；不再需要时可在停止后删除。
 
 同一项目的启停不能并行执行。若提示另一条启停命令正在运行，请等它结束再重试。若停止时 Copilot 未能恢复普通启动，先解决报错，再执行 `stop`；用于恢复的记录会保留到操作成功。
 
@@ -143,8 +145,6 @@ git pull --ff-only
   }
 ]
 ```
-
-网关不校验 API Key，`"local"` 只是满足 VS Code 必填要求的占位值。其他本机程序同样可以直接调用，不需要任何密钥。
 
 ## 令牌与安全边界
 

@@ -32,9 +32,8 @@ def test_run_status_reports_gateway_state(tmp_path, capsys, running, exit_code):
     local_dir.mkdir(parents=True)
     (tmp_path / "config.json").write_text('{"gateway_port": 19998}', encoding="utf-8")
     if running:
-        # Older PowerShell launches wrote the runtime state with a UTF-8 BOM.
         (local_dir / "pids.json").write_text(
-            '{"gatewayPort": 19999, "proxyPort": 19323}', encoding="utf-8-sig"
+            '{"gatewayPort": 19999, "proxyPort": 19323}', encoding="utf-8"
         )
     health = {"upstreamAuthenticated": True} if running else None
     with patch("copilot_app_proxy.cli.diagnostics.fetch_healthz", return_value=health):

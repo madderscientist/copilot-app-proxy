@@ -20,12 +20,7 @@ from .windows import find_copilot_executable, is_pid_alive
 
 ADDON_PATH = Path(core_package_file).resolve().with_name("relay_addon.py")
 CLI_MODULE = "copilot_app_proxy.cli"
-GATEWAY_MARKERS = (
-    f"-m {CLI_MODULE} serve --port ",
-    # Workers started by earlier versions of this project.
-    "-m cli serve --relay --port ",
-    "-m copilot_app_proxy ",
-)
+GATEWAY_MARKER = f"-m {CLI_MODULE} serve --port "
 
 
 def _require_windows() -> None:
@@ -44,18 +39,15 @@ def _kill_tree(pid: int) -> None:
 def _stop_workers(state: dict[str, Any]) -> None:
     if not state or (state.keys() == {"copilotPath"} and isinstance(state["copilotPath"], str)):
         return
-    expected: dict[int, tuple[str, ...]] = {}
-    for key, markers in (
-        ("gatewayPid", GATEWAY_MARKERS),
-        ("mitmPid", (str(ADDON_PATH).casefold(),)),
-    ):
+    expected: dict[int, str] = {}
+    for key, marker in (("gatewayPid", GATEWAY_MARKER), ("mitmPid", str(ADDON_PATH).casefold())):
         pid = state.get(key)
         if type(pid) is not int or pid <= 0:
             raise ValueError(f"Invalid {key} in pids.json.")
-        expected[pid] = markers
+        expected[pid] = marker
     # A recorded PID may now belong to a different process.
     for pid, command in windows.process_commands(list(expected)).items():
-        if any(marker in command.casefold() for marker in expected[pid]):
+        if expected[pid] in command.casefold():
             _kill_tree(pid)
         else:
             print(f"Skipping PID {pid}: no longer matches the proxy process.", file=sys.stderr)
@@ -198,7 +190,7 @@ def _start_locked(
     local = local_dir(root)
     state = _read_runtime_state(local)
     thumb_file = local / "ca-thumbprint.txt"
-    previous_session = bool(state) or thumb_file.exists()
+    previous_session = bool(state)
     _stop_workers(state)
     for port in (gateway_port, proxy_port):
         if is_port_listening(port):
@@ -279,6 +271,6 @@ def stop(root: Path) -> int:
     with windows.lifecycle_lock(local):
         state = _read_runtime_state(local)
         _stop_workers(state)
-        _cleanup(local, restore=bool(state) or (local / "ca-thumbprint.txt").is_file())
+        _cleanup(local, restore=bool(state))
     print("Proxy stopped and temporary CA removed.")
     return 0

@@ -72,8 +72,7 @@ def active_ports(root: Path, gateway_port: int | None = None) -> tuple[int, int]
 
 def read_pids(local: Path) -> dict[str, Any]:
     try:
-        # Records written by the former PowerShell launcher start with a UTF-8 BOM.
-        data = json.loads((local / "pids.json").read_text(encoding="utf-8-sig"))
+        data = json.loads((local / "pids.json").read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}

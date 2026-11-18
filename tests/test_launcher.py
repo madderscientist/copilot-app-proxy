@@ -34,23 +34,9 @@ def test_config_validation_and_doctor_overrides(tmp_path, monkeypatch, capsys):
         resolve_ports(tmp_path)
 
 
-CURRENT_GATEWAY = "python -m copilot_app_proxy.cli serve --port 20024"
-
-
-@pytest.mark.parametrize(
-    ("failure", "gateway_command"),
-    [
-        (None, CURRENT_GATEWAY),
-        # Gateways started by earlier versions must still be stopped.
-        (None, "python -m cli serve --relay --port 20024"),
-        (None, "python -m copilot_app_proxy --relay --port 20024"),
-        ("not ready", CURRENT_GATEWAY),
-        ("app launch failed", CURRENT_GATEWAY),
-        ("restore failed", CURRENT_GATEWAY),
-    ],
-)
+@pytest.mark.parametrize("failure", [None, "not ready", "app launch failed", "restore failed"])
 @pytest.mark.usefixtures("simulated_platform")
-def test_managed_start_and_stop(tmp_path, monkeypatch, failure, gateway_command):
+def test_managed_start_and_stop(tmp_path, monkeypatch, failure):
     exe = tmp_path / "desktop app.exe"
     exe.touch()
     kill = Mock()
@@ -79,7 +65,10 @@ def test_managed_start_and_stop(tmp_path, monkeypatch, failure, gateway_command)
     monkeypatch.setattr(
         launcher.windows,
         "process_commands",
-        lambda _: {101: gateway_command, 102: str(launcher.ADDON_PATH)},
+        lambda _: {
+            101: "python -m copilot_app_proxy.cli serve --port 20024",
+            102: str(launcher.ADDON_PATH),
+        },
     )
     local = tmp_path / ".local"
     if failure:
@@ -112,19 +101,15 @@ def test_managed_start_and_stop(tmp_path, monkeypatch, failure, gateway_command)
     assert not (local / "mitm-ca").exists()
 
 
-@pytest.mark.parametrize("legacy", [False, True])
 @pytest.mark.usefixtures("simulated_platform")
-def test_stop_can_retry_failed_desktop_restore(tmp_path, monkeypatch, legacy):
+def test_stop_can_retry_failed_desktop_restore(tmp_path, monkeypatch):
     local = tmp_path / ".local"
     local.mkdir()
     exe = tmp_path / "copilotapp.exe"
     exe.touch()
-    state_file = local / ("ca-thumbprint.txt" if legacy else "pids.json")
+    state_file = local / "pids.json"
     state_file.write_text(
-        "A" * 40 if legacy else json.dumps(
-            {"gatewayPid": 101, "mitmPid": 102, "copilotPath": str(exe)}
-        ),
-        encoding="ascii",
+        json.dumps({"gatewayPid": 101, "mitmPid": 102, "copilotPath": str(exe)}), encoding="ascii"
     )
     restore = Mock(side_effect=[OSError("could not restore"), None])
     apps = [launcher.windows.AppProcess(103, 1, exe)]
@@ -176,3 +161,14 @@ def test_serve_caches_token_relative_to_project(tmp_path, monkeypatch):
 def test_cli_requires_a_command(capsys):
     assert main([]) == 2
     assert "serve" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("trusted", [[False], [True, False], [True, True]])
+def test_remove_ca_uses_certutil(monkeypatch, trusted):
+    run = Mock()
+    monkeypatch.setattr(launcher.windows, "ca_is_trusted", Mock(side_effect=trusted))
+    monkeypatch.setattr(launcher.windows.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="still trusted") if trusted[-1] else nullcontext():
+        launcher.windows.remove_ca("A" * 40)
+    expected = [call(["certutil.exe", "-user", "-delstore", "Root", "A" * 40], check=True)]
+    assert run.call_args_list == (expected if trusted[0] else [])
