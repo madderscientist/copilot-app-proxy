@@ -69,6 +69,13 @@ Set-Location copilot-app-proxy
 
 在 VS Code 聊天的模型管理中选择 **Add Models → Custom Endpoint**，填入 `copilot-proxy vscode-config` 输出的 JSON，详见[客户端配置](#客户端配置)。
 
+使用 Remote SSH 时，需要在 ~/.ssh/config 中为远程主机配置 `RemoteForward 19324 127.0.0.1:19324`，以便将本地网关端口转发到远程主机：
+```
+Host my-remote
+    HostName <远程主机地址>
+    RemoteForward 19324 127.0.0.1:19324
+```
+
 ## 日常使用
 
 ### 命令
