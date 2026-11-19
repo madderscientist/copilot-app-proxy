@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import re
 import time
@@ -438,3 +439,32 @@ def test_gateway_log_file_is_cleared_and_timestamped(tmp_path):
         handler.close()
     assert re.fullmatch(r"\d\d:\d\d:\d\d hello\n", log_file.read_text(encoding="utf-8"))
     assert not (tmp_path / "logs" / "gateway.log.1").exists()
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_before_first_byte_aborts_upstream_at_once():
+    upstream_outcome: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+    lines: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        await request.read()
+        try:
+            await asyncio.sleep(10)  # A model still thinking before its first byte.
+        except asyncio.CancelledError:
+            upstream_outcome.set_result("cancelled")
+            raise
+        upstream_outcome.set_result("completed")
+        return web.Response(text="late")
+
+    async with gateway_fixture(handler, log=lines.append) as (url, client):
+        request = asyncio.create_task(client.post(f"{url}/v1/messages", json={"model": "m"}))
+        await asyncio.sleep(0.3)
+        request.cancel()  # The user presses stop.
+        with contextlib.suppress(asyncio.CancelledError):
+            await request
+        assert await asyncio.wait_for(upstream_outcome, 3) == "cancelled"
+        for _ in range(50):
+            if lines:
+                break
+            await asyncio.sleep(0.02)
+    assert re.match(r"POST /v1/messages model=m stream=false -> aborted ", lines[0])

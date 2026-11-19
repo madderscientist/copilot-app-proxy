@@ -392,8 +392,12 @@ def create_app(
 
 @asynccontextmanager
 async def listen(app: web.Application, port: int) -> AsyncGenerator[web.AppRunner, None]:
-    """Run an app on IPv4 loopback; port 0 lets the OS select a free port."""
-    runner = web.AppRunner(app, access_log=None)
+    """Run an app on IPv4 loopback; port 0 lets the OS select a free port.
+
+    Handlers are cancelled when the client disconnects, so an abandoned model request
+    closes its upstream connection at once instead of at the next write.
+    """
+    runner = web.AppRunner(app, access_log=None, handler_cancellation=True)
     try:
         await runner.setup()
         await web.TCPSite(runner, "127.0.0.1", port).start()

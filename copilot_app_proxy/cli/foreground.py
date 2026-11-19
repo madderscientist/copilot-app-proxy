@@ -81,9 +81,9 @@ class LogTail:
 
 
 def _status_color(status: str) -> str:
-    if status.isdigit() and int(status) < 400:
-        return GREEN
-    return YELLOW if status.isdigit() and int(status) < 500 else RED
+    if not status.isdigit():  # "aborted": the client went away.
+        return YELLOW
+    return GREEN if int(status) < 400 else YELLOW if int(status) < 500 else RED
 
 
 def _message(entry: LogEntry) -> str:
