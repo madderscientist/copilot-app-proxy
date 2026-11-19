@@ -131,7 +131,8 @@ def _vscode_model(port: int, model: dict[str, Any]) -> dict[str, Any]:
         "url": f"http://127.0.0.1:{port}{path}",
         "apiType": api_type,
         "toolCalling": True,
-        "vision": False,
+        # Not reported by /v1/models; base64 image input was verified on both APIs.
+        "vision": True,
         "contextWindow": context if type(context) is int and context > 0 else DEFAULT_CONTEXT_WINDOW,
         "maxOutputTokens": MAX_OUTPUT_TOKENS,
     }

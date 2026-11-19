@@ -172,7 +172,7 @@ Custom Endpoint 不会自己查询模型列表，需要逐个列出模型。`vsc
         "url": "http://127.0.0.1:19324/v1/messages",
         "apiType": "messages",
         "toolCalling": true,
-        "vision": false,
+        "vision": true,
         "thinking": true,
         "adaptiveThinking": true,
         "contextWindow": 1000000,
@@ -185,7 +185,7 @@ Custom Endpoint 不会自己查询模型列表，需要逐个列出模型。`vsc
         "url": "http://127.0.0.1:19324/v1/responses",
         "apiType": "responses",
         "toolCalling": true,
-        "vision": false,
+        "vision": true,
         "contextWindow": 1050000,
         "maxOutputTokens": 128000,
         "supportsReasoningEffort": ["none", "low", "medium", "high", "xhigh", "max"]
@@ -203,6 +203,7 @@ Custom Endpoint 不会自己查询模型列表，需要逐个列出模型。`vsc
 - **Claude**：以 `"output_config": {"effort": "high"}` 发送。上游只接受 `"thinking": {"type": "adaptive"}`，其他取值返回 400；不传时同样会自适应思考。
 - **GPT**：以 `"reasoning": {"effort": "high"}` 发送，多数模型还支持 `none`（`gpt-61-sol` 不支持）。
 - 上下文窗口 Claude 为 1000000，GPT 为 1050000。Claude 的 `max_tokens` 超过 128000 会被拒绝；GPT 的 `max_output_tokens` 上游不校验，128000 并非已验证的上限。
+- 两个系列都支持图片输入（`"vision": true`）。模型列表不声明这一点，是实测得出的。
 
 ### Codex CLI
 
