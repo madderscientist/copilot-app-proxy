@@ -61,7 +61,7 @@ Set-Location copilot-app-proxy
  Token 61 min left (expires 16:45, renews ~16:41)  keep-alive on | Ctrl+C to stop
 ```
 
-- 每行日志依次是时间、来源（`gateway`、`mitm`、`keepalive`）和内容。网关为每个 API 请求记一行，不含令牌、提示词或回复。客户端中途停止（如在 VS Code 里点停止）时状态记为 `aborted`，网关会立即断开对应的上游请求。
+- 每行日志依次是时间、来源（`gateway`、`mitm`、`keepalive`）和内容。网关为每个 API 请求记一行，不含令牌、提示词或回复。客户端中途停止（如在 VS Code 里点停止）时状态记为 `aborted`，网关会立即断开对应的上游请求。网关不限制回复时长，超时由客户端（如 VS Code）决定。上游在回复中途断开时记为 `200 truncated`（红色），网关会在流里追加一个 `error` 事件，无法安全追加时直接断开连接，让客户端报错，而不是把半截回复当作成功。
 - 颜色：状态码 2xx 绿、4xx 黄、5xx 红；令牌更新为绿，重试等提示为黄，错误为红。状态栏的令牌块底色为绿（正常）、黄（即将续期）或红（没有可用令牌或网关无响应）。设置 `NO_COLOR` 可关闭颜色。
 - 按 **Ctrl+C** 停止：结束所有进程、移除临时 CA（Windows 会弹出确认），并关闭 Copilot App。
 

@@ -8,7 +8,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -25,7 +25,10 @@ from copilot_app_proxy.relay_store import (
 
 DEFAULT_UPSTREAM = "https://loki.delve.office.com/api/v1/llmapi/"
 DEFAULT_BODY_LIMIT = 8 * 1024 * 1024
-DEFAULT_TIMEOUT_MS = 120_000
+DEFAULT_BODY_TIMEOUT_MS = 120_000
+# Only connecting is bounded. A reply may take as long as the upstream needs: the client
+# owns that limit, and its disconnect cancels the upstream request at once (see ``listen``).
+UPSTREAM_TIMEOUT = aiohttp.ClientTimeout(connect=30)
 INGEST_BODY_LIMIT = 64 * 1024
 MIN_INGEST_SECRET_LENGTH = 32
 
@@ -52,6 +55,19 @@ RESPONSE_HEADERS = (
     "anthropic-ratelimit-tokens-remaining",
     "anthropic-ratelimit-tokens-reset",
 )
+
+
+def _sse_error(**payload: Any) -> bytes:
+    return f"event: error\ndata: {json.dumps({'type': 'error', **payload})}\n\n".encode()
+
+
+# Sent in-band, in each API's own shape, when a committed SSE stream dies.
+_STREAM_ENDED = "Upstream stream ended unexpectedly."
+SSE_TRUNCATED_EVENTS = {
+    "/v1/messages": _sse_error(error={"type": "api_error", "message": _STREAM_ENDED}),
+    "/v1/responses": _sse_error(code="server_error", message=_STREAM_ENDED),
+}
+_SSE_EVENT_ENDS = (b"\n\n", b"\r\n\r\n")
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 Logger = Callable[[str], None]
@@ -191,12 +207,30 @@ async def _read_json_body(
     return body, parsed
 
 
+async def _end_truncated_stream(
+    request: web.Request, stream_resp: web.StreamResponse, last_chunk: bytes
+) -> None:
+    """End a response whose upstream died mid-body so the client sees an error, not success."""
+    event = SSE_TRUNCATED_EVENTS.get(request.path)
+    if (
+        event
+        and stream_resp.content_type == "text/event-stream"
+        and (not last_chunk or last_chunk.endswith(_SSE_EVENT_ENDS))
+    ):
+        with suppress(Exception):  # The client may already be gone.
+            await stream_resp.write(event)
+            await stream_resp.write_eof()
+    elif request.transport is not None:
+        # Appending would corrupt a partial event and a clean end would pass a cut body off
+        # as complete, so leave the transfer visibly incomplete instead.
+        request.transport.close()
+
+
 async def _forward(
     request: web.Request,
     target_url: str,
     token: str,
     body: bytes | None,
-    timeout_sec: float,
 ) -> web.StreamResponse:
     # Built from scratch so caller credentials and other headers never reach the upstream.
     headers: dict[str, str] = {
@@ -218,8 +252,8 @@ async def _forward(
         headers["content-length"] = str(len(body))
 
     session = request.app[CLIENT_SESSION_KEY]
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
     stream_resp: web.StreamResponse | None = None
+    last_chunk = b""
 
     try:
         async with session.request(
@@ -227,7 +261,6 @@ async def _forward(
             target_url,
             headers=headers,
             data=body,
-            timeout=timeout,
             allow_redirects=False,
         ) as upstream_resp:
             stream_resp = web.StreamResponse(status=upstream_resp.status or 502)
@@ -243,11 +276,15 @@ async def _forward(
             async for chunk in upstream_resp.content.iter_any():
                 if chunk:
                     await stream_resp.write(chunk)
+                    last_chunk = chunk
             await stream_resp.write_eof()
             return stream_resp
     except (aiohttp.ClientError, OSError) as exc:
-        # A committed stream cannot be replaced by a JSON error.
+        # A committed response cannot be replaced by a JSON error.
         if stream_resp is not None and stream_resp.prepared:
+            if (info := _access_info.get()) is not None:
+                info["truncated"] = True
+            await _end_truncated_stream(request, stream_resp, last_chunk)
             return stream_resp
         if isinstance(exc, TimeoutError):
             raise RequestError(504, "api_error", "Upstream timed out.") from exc
@@ -284,6 +321,8 @@ def _access_line(
     if "stream" in info:
         parts.append(f"stream={str(info['stream']).lower()}")
     parts.append(f"-> {status}")
+    if info.get("truncated"):
+        parts.append("truncated")
     if headers_at := info.get("headersAt"):
         parts.append(f"headers={headers_at - started:.2f}s")
     parts.append(f"total={time.monotonic() - started:.2f}s")
@@ -292,7 +331,7 @@ def _access_line(
 
 async def _http_client(app: web.Application) -> AsyncGenerator[None, None]:
     async with aiohttp.ClientSession(
-        connector=aiohttp.TCPConnector(limit=64), auto_decompress=False
+        connector=aiohttp.TCPConnector(limit=64), auto_decompress=False, timeout=UPSTREAM_TIMEOUT
     ) as session:
         app[CLIENT_SESSION_KEY] = session
         yield
@@ -317,7 +356,7 @@ def create_app(
     relay_ingest_secret: str,
     upstream_base: str = DEFAULT_UPSTREAM,
     body_limit: int = DEFAULT_BODY_LIMIT,
-    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    body_timeout_ms: int = DEFAULT_BODY_TIMEOUT_MS,
     log: Logger | None = None,
 ) -> web.Application:
     """Create the gateway app.
@@ -325,7 +364,8 @@ def create_app(
     Model routes need no caller credentials: any local program may call them, while the
     Host/Origin checks keep browser pages out. Only the relay addon may push tokens, using
     the per-run ``relay_ingest_secret``. ``log`` receives one line per API request and per
-    token update; it never sees tokens or bodies.
+    token update; it never sees tokens or bodies. ``body_timeout_ms`` bounds reading a
+    request body; upstream replies are deliberately not time-limited (``UPSTREAM_TIMEOUT``).
     """
     if not isinstance(relay_ingest_secret, str) or len(relay_ingest_secret) < (
         MIN_INGEST_SECRET_LENGTH
@@ -334,7 +374,7 @@ def create_app(
             f"relay_ingest_secret must be at least {MIN_INGEST_SECRET_LENGTH} characters."
         )
     _validate_upstream_base(upstream_base)
-    timeout_sec = timeout_ms / 1000.0
+    body_timeout_sec = body_timeout_ms / 1000.0
     expected_secret = relay_ingest_secret.encode("utf-8")
 
     async def healthz(request: web.Request) -> web.Response:
@@ -355,7 +395,7 @@ def create_app(
             raise RequestError(401, "authentication_error", "Missing relay ingest secret.")
         if not hmac.compare_digest(secret.encode("utf-8"), expected_secret):
             raise RequestError(401, "authentication_error", "Invalid relay ingest secret.")
-        _, payload = await _read_json_body(request, INGEST_BODY_LIMIT, timeout_sec)
+        _, payload = await _read_json_body(request, INGEST_BODY_LIMIT, body_timeout_sec)
         previous = relay_store.status()["tokenExpiresOn"]
         info = await relay_store.set_token(payload.get("token"))
         if log is not None and info["expiresOn"] != previous:
@@ -369,12 +409,12 @@ def create_app(
             token = relay_store.get_token()
             body = None
             if method == "POST":
-                body, parsed = await _read_json_body(request, body_limit, timeout_sec)
+                body, parsed = await _read_json_body(request, body_limit, body_timeout_sec)
                 if (access := _access_info.get()) is not None:
                     if isinstance(parsed.get("model"), str):
                         access["model"] = parsed["model"][:100]
                     access["stream"] = parsed.get("stream") is True
-            return await _forward(request, target_url, token, body, timeout_sec)
+            return await _forward(request, target_url, token, body)
 
         return forward
 

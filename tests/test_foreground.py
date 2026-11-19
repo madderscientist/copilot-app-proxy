@@ -35,6 +35,8 @@ def test_render_colors_by_source_status_and_severity():
         f"{wrap('POST', '1')} /v1/messages{wrap(' model=m', '2')} {wrap('->', '2')} "
         f"{wrap('503', '1', '31')}{wrap(' total=1.00s', '2')}"
     )
+    truncated = foreground.LogEntry("12:00:00", "gateway", "POST /v1/messages -> 200 truncated")
+    assert foreground.render(truncated, color=True).endswith(wrap("200 truncated", "1", "31"))
     renewed = foreground.LogEntry("12:00:01", "keepalive", "Token renewed: exp=x.")
     assert foreground.render(renewed, color=True).endswith(wrap("Token renewed: exp=x.", "32"))
     stderr = foreground.LogEntry("12:00:02", "mitm", "anything", stderr=True)

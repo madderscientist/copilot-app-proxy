@@ -17,7 +17,7 @@ from aiohttp import web
 
 from copilot_app_proxy.cli.diagnostics import fetch_healthz
 from copilot_app_proxy.dpapi import DpapiError
-from copilot_app_proxy.gateway import CLIENT_SESSION_KEY, create_app, listen
+from copilot_app_proxy.gateway import CLIENT_SESSION_KEY, SSE_TRUNCATED_EVENTS, create_app, listen
 from copilot_app_proxy.relay_store import RelayTokenStore, TokenPersistError
 
 SYNTHETIC_TOKEN = "synthetic-test-token-not-a-real-credential"
@@ -183,6 +183,76 @@ async def test_sse_first_chunk_arrives_before_upstream_finishes():
         assert b"message_stop" in rest
 
 
+FIRST_EVENT = b'data: {"index":0}\n\n'
+MESSAGE_STOP = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+
+def _upstream(
+    *chunks: bytes, gap: float = 0.05, drop: bool = False, content_type: str = "text/event-stream"
+):
+    """Send ``chunks`` ``gap`` seconds apart, then finish or drop the connection mid-body."""
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        await request.read()
+        resp = web.StreamResponse(status=200, headers={"content-type": content_type})
+        await resp.prepare(request)
+        for chunk in chunks:
+            await resp.write(chunk)
+            await asyncio.sleep(gap)
+        if drop:
+            assert request.transport is not None
+            request.transport.abort()
+        else:
+            await resp.write_eof()
+        return resp
+
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_reply_silences_longer_than_the_body_timeout_do_not_cut_it():
+    # Like a model thinking between events: only the client decides when to give up.
+    upstream = _upstream(FIRST_EVENT, MESSAGE_STOP, gap=0.25)
+    async with (
+        gateway_fixture(upstream, body_timeout_ms=100) as (url, client),
+        client.post(f"{url}/v1/messages", data="{}") as resp,
+    ):
+        assert await asyncio.wait_for(resp.read(), 5.0) == FIRST_EVENT + MESSAGE_STOP
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/responses"])
+async def test_stream_dropped_between_events_reports_an_error_event(path):
+    lines: list[str] = []
+    async with (
+        gateway_fixture(_upstream(FIRST_EVENT, drop=True), log=lines.append) as (url, client),
+        client.post(f"{url}{path}", data="{}") as resp,
+    ):
+        expected = FIRST_EVENT + SSE_TRUNCATED_EVENTS[path]
+        assert await asyncio.wait_for(resp.read(), 5.0) == expected
+    assert " -> 200 truncated " in lines[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_type", "partial"),
+    [
+        ("text/event-stream", b'event: content_block_delta\ndata: {"type":"content_bl'),
+        ("application/json", b'{"type":"message","content":['),
+    ],
+)
+async def test_body_cut_mid_event_or_mid_json_is_left_visibly_incomplete(content_type, partial):
+    lines: list[str] = []
+    upstream = _upstream(partial, drop=True, content_type=content_type)
+    async with (
+        gateway_fixture(upstream, log=lines.append) as (url, client),
+        client.post(f"{url}/v1/messages", data="{}") as resp,
+    ):
+        with pytest.raises(aiohttp.ClientPayloadError):
+            await asyncio.wait_for(resp.read(), 5.0)
+    assert " -> 200 truncated " in lines[0]
+
+
 @pytest.mark.asyncio
 async def test_upstream_auth_failures_preserved():
     async def handler(request: web.Request) -> web.Response:
@@ -240,29 +310,22 @@ async def test_invalid_requests_never_reach_upstream():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [502, 504])
-async def test_upstream_errors_do_not_leak_credentials(status):
+async def test_upstream_errors_do_not_leak_credentials():
     async def handler(request: web.Request) -> web.Response:
         await request.read()
-        if status == 502:
-            transport = request.transport
-            assert transport is not None
-            transport.abort()
-        else:
-            await asyncio.sleep(1.0)
+        assert request.transport is not None
+        request.transport.abort()
         return web.Response()
 
-    timeout_ms = 100 if status == 504 else 2_000
     async with (
-        gateway_fixture(handler, timeout_ms=timeout_ms) as (url, client),
+        gateway_fixture(handler) as (url, client),
         client.post(f"{url}/v1/messages", data="{}") as resp,
     ):
-        assert resp.status == status
+        assert resp.status == 502
         assert resp.headers["cache-control"] == "no-store"
-        message = "Upstream timed out." if status == 504 else "Upstream connection failed."
         assert await resp.json() == {
             "type": "error",
-            "error": {"type": "api_error", "message": message},
+            "error": {"type": "api_error", "message": "Upstream connection failed."},
         }
 
 

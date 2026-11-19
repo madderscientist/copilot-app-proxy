@@ -31,7 +31,8 @@ TIMESTAMP = re.compile(rb"^\d\d:\d\d:\d\d ")
 SOURCE_COLORS = {"gateway": CYAN, "mitm": MAGENTA, "keepalive": BLUE}
 # "POST /v1/messages model=x stream=true -> 200 headers=1.20s total=8.40s"
 ACCESS_LINE = re.compile(
-    r"^(?P<method>[A-Z]+) (?P<path>\S+)(?P<info>.*?) -> (?P<status>\S+)(?P<timing>.*)$"
+    r"^(?P<method>[A-Z]+) (?P<path>\S+)(?P<info>.*?) -> (?P<status>\S+(?: truncated)?)"
+    r"(?P<timing>.*)$"
 )
 ERROR_WORDS = re.compile(r"[Ff]ail|[Ee]rror|[Ee]xception|Traceback|unexpectedly|Gave up|not running")
 WARN_WORDS = re.compile(r"reused|relaunching|not found|expired|[Ww]aiting|[Ss]kipping")
@@ -81,6 +82,8 @@ class LogTail:
 
 
 def _status_color(status: str) -> str:
+    if status.endswith("truncated"):  # The upstream died after a success status was sent.
+        return RED
     if not status.isdigit():  # "aborted": the client went away.
         return YELLOW
     return GREEN if int(status) < 400 else YELLOW if int(status) < 500 else RED
