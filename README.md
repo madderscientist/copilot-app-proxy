@@ -152,6 +152,7 @@ Host my-remote
 | Copilot App 无法联网 | 运行 `stop`，或完全退出 App 后重新打开 |
 | 出现证书错误 | 不要跳过证书校验；运行 `stop` 后重新 `start` |
 | 模型不可用、版本头或服务地址变化 | 账号或 App 版本可能不适用，参考 API-DISCOVERY |
+| Chat 页的 Fable、Grok 等模型不在列表中 | 它们走 M365 Copilot 的会话接口，不在 Code 页的模型 API 中，无法接入，见 [API-DISCOVERY 第八节](API-DISCOVERY.md#八chat-页的模型未接入) |
 
 ## 客户端配置
 

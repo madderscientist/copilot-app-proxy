@@ -181,7 +181,34 @@ App 会一直复用缓存中的令牌，只在快到期时换新：
 - 上述上限与推理选项适用于未来的模型或版本。
 - 健康检查显示令牌未过期，上游就一定接受它。
 
-## 八、代码与维护
+## 八、Chat 页的模型（未接入）
+
+Chat 页的模型菜单里有 Code 页没有的模型，调查时有 Fable 5.1（Anthropic）和 Grok 4.6（xAI）。结论是这些模型不能用本项目的转发方式接入。
+
+**调查方法**：
+
+- 用 UI 自动化读取模型菜单；解码 App 的 HTTP 缓存，查看页面脚本和菜单数据。
+- 用缓存令牌直接请求 `llmapi`。
+- 抓包：临时扩大 `--observe` 的范围，记录 App 发往所有主机的请求和 WebSocket 帧，只保留主机、路径和 `tone`、`target` 等标识字段，不含消息正文和令牌。然后在 Chat 页分别用 Fable 5.1 和 Grok 4.6 各发一条消息，结束后插件已还原。
+
+| 项目 | 实测结果 |
+| --- | --- |
+| 服务 | M365 Copilot 的 Sydney 会话服务：WebSocket `wss://substrate.svc.cloud.microsoft/m365Copilot/Chathub/<用户ID>@<租户ID>`（SignalR 协议，发消息时调用 `chat`，服务端用 `update` 推送回复） |
+| 是否经过 `llmapi` | 否。两次发送期间没有任何发往 `loki.delve.office.com/api/v1/llmapi/` 的请求 |
+| 模型标识 | 不传模型 ID，在 `chat` 调用的 `tone` 字段里填菜单项 ID：Fable 5.1 为 `Claude_Fable`，Grok 4.6 为 `Grok_Reasoning`。菜单数据中还有 `Claude_Container`（Opus 5.5）、`Gpt_61_Sol_Reasoning` 等。同一调用还带有约 40 个 `optionsSets` 功能开关（网页、工作数据检索、代码解释器、记忆等） |
+| 计费 | 菜单数据标有 `usageBasedBillingEnabled` 和 `serviceMeterName: PremiumModelsInM365Chat`，界面也提示会消耗额度 |
+| `llmapi` 模型列表 | `X-ClientScenario` 改为 `Chat`、`Cowork` 等，返回的列表不变；可用的 API 版本也仍是第五节列出的四个 |
+| 直接调用 `llmapi` | `claude-fable-5.1` 返回 403 `model_not_allowed`（"not available on the coding-agent gateway"）；`fable-5.1`、`grok-4.6` 返回 400 `invalid_model_family` |
+
+可见 `llmapi` 是 Code 页专用的网关，模型有白名单。Chat 页的 Sonnet 5.5、Opus 5.5、GPT-5.6 Sol、GPT-6.1 Sol 在 `llmapi` 中有对应模型，可以直接使用。
+
+不另做 Sydney 转换器的原因：
+
+- **协议不对应**：Sydney 是会话接口，不接受调用方定义的工具，也不能替换系统提示。VS Code agent 依赖的工具调用无法实现，只能做有损的纯文本转换。
+- **不是模型原始输出**：回复会经过微软的系统提示、Work IQ 检索和引用处理。
+- **维护成本更高**：需要截取另一种令牌，并模拟网页客户端的私有协议，比现有中继更容易随版本失效。
+
+## 九、代码与维护
 
 架构、日常使用和客户端配置见 [README.md](README.md)。主要实现：
 
